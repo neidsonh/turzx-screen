@@ -1,0 +1,18 @@
+# dados e segredos de cada usuario
+turzx.ini
+turzx.ini.*
+layout.json
+layout.json.*
+api-token.txt
+turzx.log
+turzx.log.*
+*.tmp
+
+# gerados
+*.exe
+*.pdb
+snap.png
+
+# ferramentas locais
+.claude/
+.vs/
