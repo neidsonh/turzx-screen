@@ -13,7 +13,7 @@ Requisitos: Windows 10 ou 11 com .NET Framework 4.x, que já vem no sistema, e a
 
 As configurações ficam ao lado do `.exe`, em `turzx.ini`, `layout.json` e `api-token.txt`. Esses arquivos podem ter dados pessoais, como o link da sua agenda, e não devem ser compartilhados.
 
-Recursos opcionais: temperatura da CPU e FPS detalhado dependem do LibreHardwareMonitor, e **Cores do RGB** depende do SignalRGB.
+Recursos opcionais: temperatura da CPU e sensores detalhados dependem do LibreHardwareMonitor, e **Cores do RGB** depende do SignalRGB.
 
 ## Hardware identificado
 - Turing Smart Screen 3.5" **rev. A**, USB `1A86:5722`, serial `USB35INCHIPSV2`, aparece como porta COM (ex.: COM3). Não responde ao comando HELLO (modelo original).
