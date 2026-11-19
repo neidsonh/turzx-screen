@@ -24,9 +24,11 @@ Recursos opcionais: temperatura da CPU e sensores detalhados dependem do LibreHa
 ## Recursos
 | Área | O que faz |
 |---|---|
-| **Painel**, 6 temas | Cartões · Gráficos (histórico de 1 amostra/s) · Relógio grande · Medidores · Clima e cotações · Tocando agora |
+| **Painel**, 11 temas | Cartões · Gráficos (histórico de 1 amostra/s) · Relógio grande · Medidores · Clima e cotações · Tocando agora · Gaming · Agenda · Temperaturas (CPU, GPU e SSD em medidores, ventoinhas no rodapé) · Baterias (um painel por periférico conectado) · VPN (cliente, perfil, tempo conectada e tráfego). Todos entram no rodízio automático, na ordem escolhida com ▲▼ na aba Auto |
 | **Cores do RGB** | na aba **Painel**, usa a cor do efeito atual do SignalRGB como destaque e deriva fundo e texto do mesmo tom, conferindo a cada 2 s. Só lê os ajustes salvos no registro do usuário, sem alterar nada. Efeitos sem cor fixa mantêm as cores atuais. Desligar a opção devolve as cores anteriores |
 | **Cartões** | escolha e ordem dos cartões: CPU, RAM, GPU, temperatura da CPU e da GPU, disco, download, upload. Especificações da máquina ao lado da hora e/ou dentro dos cartões. A ordem vale também para Gráficos e Medidores |
+| **Baterias** | cartões de bateria do mouse, teclado, fone e controle, widget **Baterias** no editor e aviso em 20%. Só lê, nunca envia comandos aos aparelhos: nível que o Windows guarda para aparelhos Bluetooth conectados, DualSense/DualShock 4 (USB e Bluetooth), receptores Xenta `1D57` (Attack Shark, Delux, Inphic, ARDOR), que anunciam a bateria sozinhos, e controles Xbox (XInput). Aparelho desconectado sai da tela em até 15 s. Mouse parado, com o receptor ligado, continua com o último valor por 30 min. Protocolos baseados no [Wireless-Device-Battery-Monitor](https://github.com/krisgfx9/Wireless-Device-Battery-Monitor) (GPL-3.0) |
+| **VPN** | aba **VPN**: mostra a VPN conectada na faixa de status, no tema e no widget **VPN** do editor, no valor `{vpn}` dos textos, num cartão "VPN conectada" e num aviso ao conectar e desconectar, com opção de esconder o nome do perfil. Reconhece OpenVPN GUI (com o perfil), OpenVPN Connect, WatchGuard, FortiClient, Check Point, SonicWall, DrayTek, GlobalProtect e as VPNs do Windows (com o nome da conexão). Só lê as placas de rede virtuais: a VPN conta como conectada quando a placa dela recebe um endereço |
 | **No ar** | moldura vermelha e etiqueta quando microfone ou câmera estão em uso, com o nome do app. Valida as entradas do registro do Windows, que costumam ficar velhas. Em chamada, a regra de PC parado não apaga a tela |
 | **Imagem / GIF** | imagem ou GIF animado, preencher ou ajustar |
 | **Espelhar tela** | um monitor inteiro ou uma lupa 1:1 em volta do mouse |
@@ -35,7 +37,7 @@ Recursos opcionais: temperatura da CPU e sensores detalhados dependem do LibreHa
 | **Música** | título, artista, álbum, capa e progresso de qualquer player no controle de mídia do Windows (Spotify, navegador, VLC...). Aviso de faixa nova nos outros temas |
 | **Clima / cotações** | Open-Meteo e AwesomeAPI, gratuitas e sem chave. Clima a cada 10 min, cotações a cada 2 min |
 | **Automático** | PC parado → relógio, imagem ou tela desligada · música → tema Tocando agora · rodízio de temas · brilho noturno |
-| Geral | brilho, orientação, liga/desliga, bandeja, iniciar com o Windows, reconexão automática, oferece fechar o app TURZX se ele segurar a porta |
+| **Geral** | aba própria com brilho, orientação, liga/desliga, iniciar com o Windows, reconectar, **fonte da tela** (Segoe UI por padrão, ou qualquer fonte instalada; vale para temas, widgets e avisos), **transição** nas trocas de tela (cortina, mosaico, do centro para fora, da esquerda para a direita ou persiana; o tempo é o mesmo, muda só a ordem em que a imagem chega), API local, faixa de status e No ar. Também: bandeja, reconexão automática e oferta de fechar o app TURZX se ele segurar a porta |
 
 Prioridade da troca automática: PC parado > música > rodízio > modo escolhido. As notificações aparecem por cima de tudo.
 
@@ -99,6 +101,8 @@ O máximo é o modo **Espelhar**, que funciona para conteúdo que muda pouco.
 - `src/DirtyRects.cs`: encontra as áreas alteradas de cada quadro
 - `src/NetStats.cs`: tráfego das placas de rede físicas
 - `src/RgbSync.cs`: leitura da cor do efeito atual do SignalRGB
+- `src/Batteries.cs`: bateria dos periféricos sem fio (`TurzxScreen.exe /batlog 1` registra cada leitura em `turzx.log`)
+- `src/Vpn.cs`: VPN conectada, pelas placas de rede virtuais de cada cliente
 - `turzx.ini`: configurações, salvas logo após cada ajuste (gravação atômica)
 - `turzx.log`: erros do app, sem conteúdo de notificações (limite de 256 KB, com uma cópia `.1`)
 - `tools/snap.ps1`: captura a janela do app (desenvolvimento). `TurzxScreen.exe /tab N` abre já na aba N.

@@ -32,7 +32,7 @@ namespace TurzxScreen
 
     static class LayoutStore
     {
-        public const int First = 8; // indice do primeiro tema proprio na lista de temas
+        public const int First = 11; // indice do primeiro tema proprio (8 ate a versao 1, 10 na 2, 11 desde o tema VPN)
         static volatile List<CustomTheme> themes = new List<CustomTheme> { new CustomTheme() };
         public static volatile bool Dirty;
         static string FilePath { get { return System.IO.Path.Combine(System.IO.Path.GetDirectoryName(Application.ExecutablePath), "layout.json"); } }
@@ -233,6 +233,7 @@ namespace TurzxScreen
             return s.Replace("{cpu}", SysInfo.Cpu.ToString("0")).Replace("{ramgb}", SysInfo.RamUsedGb.ToString("0.0", PT)).Replace("{ram}", SysInfo.RamPct.ToString("0"))
                 .Replace("{gputemp}", SysInfo.GpuTemp >= 0 ? SysInfo.GpuTemp.ToString("0") : "—").Replace("{gpu}", SysInfo.GpuPct >= 0 ? SysInfo.GpuPct.ToString("0") : "—")
                 .Replace("{cputemp}", CpuTemp.Value >= 0 ? CpuTemp.Value.ToString("0") : "—")
+                .Replace("{vpn}", VpnText()).Replace("{gpufan}", Lhm.GpuFan >= 0 ? Lhm.GpuFan.ToString("0") : "—").Replace("{fan}", Lhm.CaseFan >= 0 ? Lhm.CaseFan.ToString("0") : "—")
                 .Replace("{down}", SysInfo.Rate(SysInfo.NetDown)).Replace("{up}", SysInfo.Rate(SysInfo.NetUp))
                 .Replace("{ss}", DateTime.Now.ToString("ss")).Replace("{title}", title)
                 .Replace("{game}", Gaming.Name != "" ? Gaming.Name : "Nenhum jogo aberto")
@@ -242,7 +243,7 @@ namespace TurzxScreen
         // desenvolvimento: tema original (esquerda) e copia em widgets (direita), sem abrir janelas
         void ThemeShots(string dir)
         {
-            var t = new System.Windows.Forms.Timer(); t.Interval = 6000; t.Start();
+            var t = new System.Windows.Forms.Timer(); t.Interval = 12000; t.Start(); // espera a primeira leitura das baterias
             t.Tick += delegate
             {
                 t.Stop();
@@ -323,7 +324,7 @@ namespace TurzxScreen
                     int big = land ? 132 : 104;
                     float hmW, hmH, sW, sH;
                     using (var b = new Bitmap(4, 4)) using (var g = Graphics.FromImage(b))
-                    using (var fBig = new Font("Segoe UI Light", big, GraphicsUnit.Pixel)) using (var fSec = new Font("Segoe UI Light", 40, GraphicsUnit.Pixel))
+                    using (var fBig = SF.New("Segoe UI Light", big)) using (var fSec = SF.New("Segoe UI Light", 40))
                     using (var sf = new StringFormat(StringFormat.GenericTypographic))
                     {
                         var a = g.MeasureString(TimeStr(false), fBig, 1000, sf); var c = g.MeasureString("00", fSec, 1000, sf);
@@ -395,6 +396,28 @@ namespace TurzxScreen
                     AddHeader(l, w);
                     l.Add(WBox("agenda", new Rectangle(8, 56, w - 16, h - 64), false));
                     break;
+                case 8: // temperaturas
+                {
+                    AddHeader(l, w);
+                    var ids = new List<string>();
+                    foreach (var id in TempIds) { var c = BuildCard(id, false); if (c != null && c.Pct >= 0) ids.Add(id); }
+                    if (ids.Count == 0) ids.Add("cputemp");
+                    string foot = TempFooter() != null ? (Lhm.CaseFan >= 0 ? "Ventoinhas {fan} RPM" : "") + (Lhm.CaseFan >= 0 && Lhm.GpuFan >= 0 ? "   ·   " : "") + (Lhm.GpuFan >= 0 ? "Fan GPU {gpufan} RPM" : "") : null;
+                    int top = 52, cols = land ? ids.Count : 1, rows = (ids.Count + cols - 1) / cols, bottom = foot != null ? h - 26 : h - 6;
+                    int cellW = w / cols, cellH = (bottom - top) / rows, s = Math.Min(cellW, cellH) - 6;
+                    for (int i = 0; i < ids.Count; i++)
+                        l.Add(WData("gauge", ids[i], (i % cols) * cellW + (cellW - s) / 2, top + (i / cols) * cellH + (cellH - s) / 2, s, s, 26, true, true, false));
+                    if (foot != null) l.Add(WText(foot, 0, h - 25, w, 24, 13, "dim", 1));
+                    break;
+                }
+                case 9: // baterias
+                    AddHeader(l, w);
+                    l.Add(new Widget { Type = "battery", Source = "all", X = 8, Y = 56, W = w - 16, H = h - 64, Label = false, Bg = true });
+                    break;
+                case VpnTheme:
+                    AddHeader(l, w);
+                    l.Add(new Widget { Type = "vpn", Source = "", X = 8, Y = 58, W = w - 16, H = Math.Min(h - 66, 120), Label = false, Bg = true });
+                    break;
                 default: // cartoes
                 {
                     l.Add(new Widget { Type = "clock", X = 8, Y = 2, W = 240, H = 66, Font = land ? 50 : 54, Seconds = true, Bg = false });
@@ -439,17 +462,17 @@ namespace TurzxScreen
 
         static Font FitFont(Graphics g, string s, string family, int maxW, int maxH, int fixedPx)
         {
-            if (fixedPx > 0) return new Font(family, fixedPx, GraphicsUnit.Pixel);
+            if (fixedPx > 0) return SF.New(family, fixedPx);
             int lo = 8, hi = Math.Max(9, Math.Min(160, maxH));
             while (lo < hi)
             {
                 int mid = (lo + hi + 1) / 2; bool fits;
-                using (var f = new Font(family, mid, GraphicsUnit.Pixel))
+                using (var f = SF.New(family, mid))
                     // mede como o DrawString desenha (com as margens dele), senao o texto vira "..."
                     fits = g.MeasureString(s == "" ? " " : s, f).Width <= maxW && mid * 1.2 <= maxH;
                 if (fits) lo = mid; else hi = mid - 1;
             }
-            return new Font(family, lo, GraphicsUnit.Pixel);
+            return SF.New(family, lo);
         }
 
         void DrawWidget(Graphics g, Widget x)
@@ -484,6 +507,8 @@ namespace TurzxScreen
                         case "music": DrawWidgetMusic(g, x, r, fg, dim, sf); break;
                         case "image": DrawWidgetImage(g, x, r, dim, sf); break;
                         case "specs": DrawWidgetSpecs(g, x, r, fg, acc, sf); break;
+                        case "battery": DrawWidgetBattery(g, x, r, fg, acc, sf); break;
+                        case "vpn": DrawVpnBox(g, new Rectangle(r.X + 2, r.Y + 2, Math.Max(1, r.Width - 4), Math.Max(1, r.Height - 4)), false, x.Label, x.Font); break;
                         case "forecast": g.TranslateTransform(r.X, r.Y); DrawWeatherBox(g, new Rectangle(0, 0, r.Width, r.Height)); break;
                         case "quotes": g.TranslateTransform(r.X, r.Y); DrawQuotesBox(g, new Rectangle(0, 0, r.Width, r.Height)); break;
                         case "agenda": g.TranslateTransform(r.X, r.Y); DrawAgendaBox(g, new Rectangle(0, 0, r.Width, r.Height)); break;
@@ -524,7 +549,7 @@ namespace TurzxScreen
             int top = r.Y + 4, bottom = r.Bottom - 4;
             if (x.Label)
             {
-                using (var f = new Font("Segoe UI Semibold", Math.Max(9, Math.Min(13, r.Height / 5)), GraphicsUnit.Pixel))
+                using (var f = SF.New("Segoe UI Semibold", Math.Max(9, Math.Min(13, r.Height / 5))))
                     g.DrawString(c.Label, f, acc, new RectangleF(r.X + 7, top, r.Width - 12, f.Height), sf);
                 top += Math.Max(11, Math.Min(16, r.Height / 4));
             }
@@ -533,18 +558,18 @@ namespace TurzxScreen
                 var bar = new Rectangle(r.X + 7, r.Bottom - 10, r.Width - 14, 5);
                 using (var bb = new SolidBrush(Color.FromArgb(50, fgColor))) g.FillRectangle(bb, bar);
                 bar.Width = (int)(bar.Width * Math.Min(100, c.Pct) / 100);
-                using (var b = new SolidBrush(c.Temp ? TempColor(c.Pct) : accent)) if (bar.Width > 0) g.FillRectangle(b, bar);
+                using (var b = new SolidBrush(CardColor(c, c.Pct))) if (bar.Width > 0) g.FillRectangle(b, bar);
                 bottom -= 9;
             }
             if (x.Detail && c.Sub != "" && bottom - top >= 40)
             {
                 bottom -= 16;
-                using (var f = new Font("Segoe UI", 12, GraphicsUnit.Pixel)) using (var dim = new SolidBrush(Color.FromArgb(160, fgColor)))
+                using (var f = SF.New("Segoe UI", 12)) using (var dim = new SolidBrush(Color.FromArgb(160, fgColor)))
                     g.DrawString(c.Sub, f, dim, new RectangleF(r.X + 7, bottom, r.Width - 12, 16), sf);
             }
             var valueRect = new Rectangle(r.X + 7, top, Math.Max(1, r.Width - 12), Math.Max(1, bottom - top));
-            if (x.Color == "temp" && c.Temp && c.Pct >= 0)
-                using (var tb = new SolidBrush(TempColor(c.Pct))) DrawFit(g, c.Value, "Segoe UI Semibold", valueRect, x.Font, tb, sf);
+            if (x.Color == "temp" && (c.Temp || c.Bat) && c.Pct >= 0)
+                using (var tb = new SolidBrush(CardColor(c, c.Pct))) DrawFit(g, c.Value, "Segoe UI Semibold", valueRect, x.Font, tb, sf);
             else DrawFit(g, c.Value, "Segoe UI Semibold", valueRect, x.Font, fg, sf);
         }
 
@@ -555,7 +580,7 @@ namespace TurzxScreen
             var a = new Rectangle(r.X + (r.Width - d) / 2, r.Y + (r.Height - d) / 2, d, d);
             double v = Math.Max(0, Math.Min(100, c.Pct));
             using (var bp = new Pen(Color.FromArgb(60, fgColor), th)) g.DrawArc(bp, a, 135, 270);
-            using (var p = new Pen(c.Temp ? TempColor(v) : accent, th))
+            using (var p = new Pen(CardColor(c, v), th))
             {
                 p.StartCap = LineCap.Round; p.EndCap = LineCap.Round;
                 if (v > 0.5) g.DrawArc(p, a, 135, (float)(270 * v / 100));
@@ -564,7 +589,7 @@ namespace TurzxScreen
             {
                 m.Alignment = StringAlignment.Center;
                 DrawFit(g, c.Value, "Segoe UI Semibold", new Rectangle(a.X + th, a.Y + d / 4, Math.Max(1, d - th * 2), Math.Max(1, d / 2)), x.Font, fg, m);
-                if (x.Label) using (var f = new Font("Segoe UI", Math.Max(9, d / 8), GraphicsUnit.Pixel))
+                if (x.Label) using (var f = SF.New("Segoe UI", Math.Max(9, d / 8)))
                     g.DrawString(c.Label, f, acc, new RectangleF(r.X, a.Bottom - f.Height - 1, r.Width, f.Height + 2), m);
             }
         }
@@ -579,7 +604,7 @@ namespace TurzxScreen
             if (x.Label)
             {
                 var c = WidgetCard(x.Source, false);
-                using (var f = new Font("Segoe UI Semibold", 12, GraphicsUnit.Pixel)) using (var m = (StringFormat)sf.Clone())
+                using (var f = SF.New("Segoe UI Semibold", 12)) using (var m = (StringFormat)sf.Clone())
                 {
                     g.DrawString(c != null ? c.Label : x.Source, f, acc, new RectangleF(r.X + 7, top, r.Width / 2, 16), sf);
                     m.Alignment = StringAlignment.Far;
@@ -611,10 +636,62 @@ namespace TurzxScreen
                 tx = r.X + s + 10;
             }
             int tw = Math.Max(1, r.Right - tx - 5), h1 = r.Height * 5 / 9;
-            using (var f = new Font("Segoe UI Semibold", x.Font > 0 ? x.Font : Math.Max(10, Math.Min(18, h1 * 2 / 3)), GraphicsUnit.Pixel))
+            using (var f = SF.New("Segoe UI Semibold", x.Font > 0 ? x.Font : Math.Max(10, Math.Min(18, h1 * 2 / 3))))
                 g.DrawString(Media.Title, f, fg, new RectangleF(tx, r.Y + 3, tw, h1), sf);
-            using (var f = new Font("Segoe UI", Math.Max(9, Math.Min(14, r.Height / 4)), GraphicsUnit.Pixel))
+            using (var f = SF.New("Segoe UI", Math.Max(9, Math.Min(14, r.Height / 4))))
                 g.DrawString(Media.Artist, f, dim, new RectangleF(tx, r.Y + 3 + h1, tw, r.Height - h1 - 6), sf);
+        }
+
+        // uma linha por periferico: tipo, nome, barra e porcentagem
+        void DrawWidgetBattery(Graphics g, Widget x, Rectangle r, Brush fg, Brush acc, StringFormat sf)
+        {
+            var inner = new Rectangle(r.X + 7, r.Y + 4, Math.Max(1, r.Width - 14), Math.Max(1, r.Height - 8));
+            var list = new List<BatteryDevice>();
+            foreach (var d in Batteries.List) if (x.Source == "all" || x.Source == "" || d.Kind == x.Source) list.Add(d);
+            if (x.Label && inner.Height >= 40)
+                using (var f = SF.New("Segoe UI Semibold", Math.Max(9, Math.Min(13, inner.Height / 6))))
+                using (var left = (StringFormat)sf.Clone())
+                {
+                    left.Alignment = StringAlignment.Near;
+                    g.DrawString("BATERIAS", f, acc, new RectangleF(inner.X, inner.Y, inner.Width, f.Height), left);
+                    inner.Y += f.Height + 2; inner.Height -= f.Height + 2;
+                }
+            using (var dim = new SolidBrush(Color.FromArgb(150, fgColor)))
+            {
+                if (list.Count == 0) { DrawFit(g, "Nenhum periférico sem fio", "Segoe UI", inner, x.Font > 0 ? x.Font : 14, dim, sf); return; }
+                int minRow = x.Font > 0 ? Math.Max(16, (int)(x.Font * 1.5)) : 18;
+                int n = Math.Max(1, Math.Min(list.Count, inner.Height / minRow)), rowH = Math.Min(inner.Height / n, 44);
+                int px = x.Font > 0 ? x.Font : Math.Max(10, Math.Min(18, rowH * 9 / 20));
+                using (var f = SF.New("Segoe UI Semibold", px))
+                using (var fs = SF.New("Segoe UI", Math.Max(9, px - 2)))
+                using (var left = new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap })
+                using (var right = new StringFormat { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center, FormatFlags = StringFormatFlags.NoWrap })
+                using (var barBg = new SolidBrush(Color.FromArgb(50, fgColor)))
+                {
+                    int pctW = (int)g.MeasureString("100%", f).Width + 4;
+                    for (int i = 0; i < n; i++)
+                    {
+                        var d = list[i];
+                        int y = inner.Y + i * rowH;
+                        bool bar = rowH >= px + 10;
+                        int textH = bar ? rowH - 8 : rowH;
+                        string pct = d.Percent >= 0 ? d.Percent + "%" : d.Charging ? "⚡" : "—";
+                        Brush main = d.Asleep ? dim : fg;
+                        g.DrawString(pct, f, main, new RectangleF(inner.Right - pctW, y, pctW, textH), right);
+                        string name = Batteries.KindName(d.Kind) + (d.Charging && d.Percent >= 0 ? " ⚡" : "");
+                        float kw = g.MeasureString(name, f).Width;
+                        g.DrawString(name, f, main, new RectangleF(inner.X, y, inner.Width - pctW, textH), left);
+                        g.DrawString(d.Name + (d.Asleep ? " · dormindo" : ""), fs, dim, new RectangleF(inner.X + kw + 2, y, Math.Max(1, inner.Width - pctW - kw - 2), textH), left);
+                        if (bar && d.Percent >= 0)
+                        {
+                            var b = new Rectangle(inner.X, y + rowH - 7, inner.Width, 4);
+                            g.FillRectangle(barBg, b);
+                            b.Width = (int)(b.Width * Math.Min(100, d.Percent) / 100.0);
+                            using (var bb = new SolidBrush(d.Asleep ? Color.FromArgb(120, BatColor(d.Percent)) : BatColor(d.Percent))) if (b.Width > 0) g.FillRectangle(bb, b);
+                        }
+                    }
+                }
+            }
         }
 
         void DrawWidgetSpecs(Graphics g, Widget x, Rectangle r, Brush fg, Brush acc, StringFormat sf)
@@ -629,7 +706,7 @@ namespace TurzxScreen
                 {
                     int top = inner.Y;
                     if (x.Label && inner.Height >= 30)
-                        using (var f = new Font("Segoe UI Semibold", Math.Max(9, Math.Min(13, inner.Height / 4)), GraphicsUnit.Pixel))
+                        using (var f = SF.New("Segoe UI Semibold", Math.Max(9, Math.Min(13, inner.Height / 4))))
                         {
                             g.DrawString(item[2], f, acc, new RectangleF(inner.X, top, inner.Width, f.Height), left);
                             top += f.Height;
@@ -645,7 +722,7 @@ namespace TurzxScreen
                 if (rows.Count == 0) { DrawFit(g, "Não detectado", "Segoe UI", inner, x.Font, fg, sf); return; }
                 int minRow = x.Font > 0 ? Math.Max(12, (int)(x.Font * 1.2)) : 12;
                 int n = Math.Max(1, Math.Min(rows.Count, inner.Height / minRow)), rowH = inner.Height / n;
-                using (var lf = new Font("Segoe UI Semibold", x.Font > 0 ? x.Font : Math.Max(9, Math.Min(13, rowH * 2 / 3)), GraphicsUnit.Pixel))
+                using (var lf = SF.New("Segoe UI Semibold", x.Font > 0 ? x.Font : Math.Max(9, Math.Min(13, rowH * 2 / 3))))
                 {
                     int labelW = 0; string longest = "";
                     for (int i = 0; i < n; i++)
@@ -730,10 +807,10 @@ namespace TurzxScreen
         class EditorForm : Form
         {
             static readonly string[][] Types = {
-                new[] { "clock", "Relogio" }, new[] { "date", "Data" }, new[] { "text", "Texto" }, new[] { "metric", "Metrica" },
-                new[] { "gauge", "Medidor" }, new[] { "graph", "Grafico" }, new[] { "weather", "Clima" }, new[] { "forecast", "Previsão" },
-                new[] { "quotes", "Cotações" }, new[] { "music", "Musica" }, new[] { "player", "Player" }, new[] { "agenda", "Agenda" },
-                new[] { "fps", "Painel FPS" }, new[] { "specs", "Máquina" }, new[] { "image", "Imagem" }, new[] { "panel", "Painel" } };
+                new[] { "clock", "Relógio" }, new[] { "date", "Data" }, new[] { "text", "Texto" }, new[] { "metric", "Métrica" },
+                new[] { "gauge", "Medidor" }, new[] { "graph", "Gráfico" }, new[] { "weather", "Clima" }, new[] { "forecast", "Previsão" },
+                new[] { "quotes", "Cotações" }, new[] { "music", "Música" }, new[] { "player", "Player" }, new[] { "agenda", "Agenda" },
+                new[] { "fps", "Painel FPS" }, new[] { "specs", "Máquina" }, new[] { "battery", "Baterias" }, new[] { "vpn", "VPN" },new[] { "image", "Imagem" }, new[] { "panel", "Painel" } };
             public bool DeleteRequested;
             public bool Modified { get { return undo.Count > 0 || renamed; } }
             bool renamed;
@@ -779,7 +856,7 @@ namespace TurzxScreen
                 y += 8;
                 m.Btn("Duplicar", 10, y, 112, this, delegate { Duplicate(); }); y += 29;
                 m.Btn("Trazer p/ frente", 10, y, 112, this, delegate { Reorder(true); }); y += 29;
-                m.Btn("Enviar p/ tras", 10, y, 112, this, delegate { Reorder(false); }); y += 29;
+                m.Btn("Enviar p/ trás", 10, y, 112, this, delegate { Reorder(false); }); y += 29;
                 m.Btn("Excluir", 10, y, 112, this, delegate { Delete(); }); y += 29;
                 m.Btn("Desfazer", 10, y, 112, this, delegate { Undo(); });
 
@@ -789,7 +866,7 @@ namespace TurzxScreen
                 Controls.Add(canvas);
                 var hint = m.L("Arraste para mover, puxe os cantos para redimensionar. Setas ajustam (Shift = 10 px). Delete exclui, Ctrl+Z desfaz, Ctrl+D duplica.", 132, ch + 16, this);
                 hint.ForeColor = Color.Gray;
-                m.Btn("Restaurar padrao", 132, ch + 40, 120, this, delegate
+                m.Btn("Restaurar padrão", 132, ch + 40, 120, this, delegate
                 {
                     int from = LayoutStore.BaseTheme(theme);
                     string what = from >= 0 ? "o tema " + ThemeNames[from] : "o padrao";
@@ -841,7 +918,7 @@ namespace TurzxScreen
                 lblFont = (Label)m.L("Fonte", 0, 158, props);
                 nFont = m.Add(new NumericUpDown(), 48, 156, 56, props); nFont.Maximum = 200;
                 nFont.ValueChanged += delegate { Apply(w => w.Font = (int)nFont.Value); };
-                m.L("0 = automatica", 110, 158, props).ForeColor = Color.Gray;
+                m.L("0 = automática", 110, 158, props).ForeColor = Color.Gray;
                 lblAlign = (Label)m.L("Alinhar", 0, 188, props);
                 cbAlign = m.Add(new ComboBox(), 48, 186, 110, props); cbAlign.DropDownStyle = ComboBoxStyle.DropDownList;
                 cbAlign.Items.AddRange(new object[] { "Esquerda", "Centro", "Direita" });
@@ -857,13 +934,13 @@ namespace TurzxScreen
                 });
                 bTheme = m.Btn("Cor do tema", 108, 218, 104, props, delegate { Apply(w => w.Color = ""); ShowProps(); });
                 cBg = m.Chk("Fundo", true, 0, 252, props, delegate { Apply(w => w.Bg = cBg.Checked); });
-                cLabel = m.Chk("Mostrar rotulo", true, 70, 252, props, delegate { Apply(w => w.Label = cLabel.Checked); });
+                cLabel = m.Chk("Mostrar rótulo", true, 70, 252, props, delegate { Apply(w => w.Label = cLabel.Checked); });
                 cSec = m.Chk("Mostrar segundos", false, 0, 278, props, delegate { Apply(w => w.Seconds = cSec.Checked); });
                 cBold = m.Chk("Negrito", false, 130, 278, props, delegate { Apply(w => w.Bold = cBold.Checked); });
                 cThin = m.Chk("Fonte fina", false, 70, 252, props, delegate { Apply(w => w.Thin = cThin.Checked); });
                 cBar = m.Chk("Mostrar barra", true, 0, 278, props, delegate { Apply(w => w.Bar = cBar.Checked); });
                 cDetail = m.Chk("Mostrar detalhe", false, 104, 278, props, delegate { Apply(w => w.Detail = cDetail.Checked); });
-                lblTokens = m.L("Valores ao vivo no texto:\n{cpu} {ram} {ramgb} {gpu}\n{cputemp} {gputemp}\n{down} {up} {ss} {title}\n{game} {place} {temp}", 0, 278, props);
+                lblTokens = m.L("Valores ao vivo no texto:\n{cpu} {ram} {ramgb} {gpu}\n{cputemp} {gputemp}\n{down} {up} {ss} {title}\n{game} {place} {temp}\n{vpn} {fan} {gpufan}", 0, 278, props);
                 lblTokens.ForeColor = Color.Gray;
             }
 
@@ -887,17 +964,24 @@ namespace TurzxScreen
                 }
                 if (type == "graph")
                 {
-                    yield return new SourceItem { Id = "cpu", Name = "CPU" }; yield return new SourceItem { Id = "ram", Name = "Memoria RAM" };
+                    yield return new SourceItem { Id = "cpu", Name = "CPU" }; yield return new SourceItem { Id = "ram", Name = "Memória RAM" };
                     yield return new SourceItem { Id = "gpu", Name = "GPU" }; yield return new SourceItem { Id = "fps", Name = "FPS" };
                     yield break;
                 }
-                var pct = new HashSet<string> { "cpu", "ram", "gpu", "cputemp", "gputemp", "disk", "ssdtemp" };
+                if (type == "battery")
+                {
+                    yield return new SourceItem { Id = "all", Name = "Todos os periféricos" };
+                    foreach (var k in new[] { "mouse", "keyboard", "headset", "gamepad" })
+                        yield return new SourceItem { Id = k, Name = "Só " + Batteries.KindName(k).ToLowerInvariant() };
+                    yield break;
+                }
+                var pct = new HashSet<string> { "cpu", "ram", "gpu", "cputemp", "gputemp", "disk", "ssdtemp", "batmouse", "batkeyboard", "batheadset", "batgamepad" };
                 for (int i = 0; i < CardIds.Length; i++)
                     if (type == "metric" || pct.Contains(CardIds[i])) yield return new SourceItem { Id = CardIds[i], Name = CardNames[i] };
-                yield return new SourceItem { Id = "rampct", Name = "Memoria RAM (%)" };
+                yield return new SourceItem { Id = "rampct", Name = "Memória RAM (%)" };
                 if (type == "metric")
                 {
-                    yield return new SourceItem { Id = "ramgb", Name = "Memoria RAM usada (GB)" };
+                    yield return new SourceItem { Id = "ramgb", Name = "Memória RAM usada (GB)" };
                     yield return new SourceItem { Id = "fps", Name = "FPS" };
                 }
             }
@@ -913,7 +997,7 @@ namespace TurzxScreen
                 foreach (var d in Types) if (d[0] == t) name = d[1];
                 lblType.Text = name;
                 nX.Value = Clamp(nX, sel.X); nY.Value = Clamp(nY, sel.Y); nW.Value = Clamp(nW, sel.W); nH.Value = Clamp(nH, sel.H);
-                bool source = t == "metric" || t == "gauge" || t == "graph" || t == "specs";
+                bool source = t == "metric" || t == "gauge" || t == "graph" || t == "specs" || t == "battery";
                 lblSource.Visible = cbSource.Visible = source;
                 if (source)
                 {
@@ -923,9 +1007,9 @@ namespace TurzxScreen
                 }
                 txt.Visible = t == "text"; if (t == "text") txt.Text = sel.Text;
                 bImage.Visible = cFill.Visible = t == "image"; cFill.Checked = sel.Fill;
-                bool hasFont = t == "clock" || t == "date" || t == "text" || t == "metric" || t == "gauge" || t == "weather" || t == "music" || t == "specs";
+                bool hasFont = t == "clock" || t == "date" || t == "text" || t == "metric" || t == "gauge" || t == "weather" || t == "music" || t == "specs" || t == "battery" || t == "vpn";
                 lblFont.Visible = nFont.Visible = hasFont; nFont.Value = Math.Min(200, sel.Font);
-                foreach (Control c in props.Controls) if (c is Label && c.Text == "0 = automatica") c.Visible = hasFont;
+                foreach (Control c in props.Controls) if (c is Label && c.Text == "0 = automática") c.Visible = hasFont;
                 bool align = t == "clock" || t == "date" || t == "text" || t == "metric" || t == "specs";
                 lblAlign.Visible = cbAlign.Visible = align; cbAlign.SelectedIndex = Math.Max(0, Math.Min(2, sel.Align));
                 bool color = t != "image" && t != "panel" && t != "forecast" && t != "quotes" && t != "player" && t != "agenda" && t != "fps";
@@ -933,7 +1017,7 @@ namespace TurzxScreen
                 bool picked = sel.Color.StartsWith("#");
                 bColor.BackColor = picked ? m.WidgetColor(sel.Color) : SystemColors.Control;
                 bColor.ForeColor = picked ? Contrast(m.WidgetColor(sel.Color)) : SystemColors.ControlText;
-                cBg.Checked = sel.Bg; cLabel.Checked = sel.Label; cLabel.Visible = t == "metric" || t == "gauge" || t == "graph" || t == "specs";
+                cBg.Checked = sel.Bg; cLabel.Checked = sel.Label; cLabel.Visible = t == "metric" || t == "gauge" || t == "graph" || t == "specs" || t == "battery" || t == "vpn";
                 cSec.Checked = sel.Seconds; cSec.Visible = t == "clock";
                 cBold.Checked = sel.Bold; cBold.Visible = t == "clock";
                 cThin.Checked = sel.Thin; cThin.Visible = t == "text";
@@ -1070,6 +1154,8 @@ namespace TurzxScreen
                     case "weather": w.W = 150; w.H = 72; break;
                     case "music": w.W = 230; w.H = 72; break;
                     case "specs": w.W = Math.Min(sw - 32, 260); w.H = 112; w.Source = "all"; break;
+                    case "battery": w.W = Math.Min(sw - 32, 260); w.H = 120; w.Source = "all"; w.Label = true; break;
+                    case "vpn": w.W = Math.Min(sw - 32, 260); w.H = 70; w.Label = false; break;
                     case "forecast": w.W = 224; w.H = 210; break;
                     case "quotes": w.W = 224; w.H = 190; break;
                     case "player": w.W = 320; w.H = 200; w.Bg = false; break;

@@ -140,11 +140,78 @@ namespace TurzxScreen
             }
             ToRgb565(bmp, cur);
             if (invalid) { invalid = false; prevValid = false; }
-            if (!prevValid) SendRect(cur, w, 0, 0, w - 1, h - 1);
+            int tr = Transition;
+            if (!prevValid)
+            {
+                if (tr == 0) SendRect(cur, w, 0, 0, w - 1, h - 1);
+                else SendTransition(cur, null, w, h, tr);
+            }
             else
-                foreach (var r in DirtyRects.Find(cur, prev, w, h))
-                    SendRect(cur, w, r.Left, r.Top, r.Right - 1, r.Bottom - 1);
+            {
+                var rects = DirtyRects.Find(cur, prev, w, h);
+                long area = 0; foreach (var r in rects) area += (long)r.Width * r.Height;
+                // troca de tela (muda quase tudo): envia na ordem da transicao escolhida
+                if (tr != 0 && area > (long)w * h * 45 / 100) SendTransition(cur, prev, w, h, tr);
+                else
+                    foreach (var r in rects)
+                        SendRect(cur, w, r.Left, r.Top, r.Right - 1, r.Bottom - 1);
+            }
             var old = prev; prev = cur; cur = old; prevValid = true;
+        }
+
+        // 0 cortina (de cima para baixo, o normal), 1 mosaico, 2 do centro para fora, 3 da esquerda
+        // para a direita, 4 persiana. O tempo total e o mesmo (limite da tela); muda so a ordem.
+        public volatile int Transition;
+        public static readonly string[] TransitionNames = { "Cortina (de cima para baixo)", "Mosaico", "Do centro para fora", "Da esquerda para a direita", "Persiana" };
+        static readonly Random rnd = new Random();
+
+        void SendTransition(byte[] px, byte[] old, int w, int h, int tr)
+        {
+            if (tr == 4)
+            {
+                // faixas de 16 linhas intercaladas: 1a de cada 4, depois a 2a...
+                const int band = 16;
+                for (int pass = 0; pass < 4; pass++)
+                    for (int y = pass * band; y < h; y += band * 4)
+                    {
+                        int y1 = Math.Min(h, y + band) - 1;
+                        if (old == null || !SameArea(px, old, w, 0, y, w - 1, y1)) SendRect(px, w, 0, y, w - 1, y1);
+                    }
+                return;
+            }
+            const int t = 32;
+            var tiles = new List<Rectangle>();
+            for (int y = 0; y < h; y += t)
+                for (int x = 0; x < w; x += t)
+                {
+                    var r = new Rectangle(x, y, Math.Min(t, w - x), Math.Min(t, h - y));
+                    if (old == null || !SameArea(px, old, w, r.X, r.Y, r.Right - 1, r.Bottom - 1)) tiles.Add(r);
+                }
+            if (tr == 1)
+                lock (rnd) for (int i = tiles.Count - 1; i > 0; i--) { int j = rnd.Next(i + 1); var s = tiles[i]; tiles[i] = tiles[j]; tiles[j] = s; }
+            else if (tr == 2)
+            {
+                double cx = w / 2.0, cy = h / 2.0;
+                tiles.Sort((a, b) => Dist(a, cx, cy).CompareTo(Dist(b, cx, cy)));
+            }
+            else if (tr == 3) tiles.Sort((a, b) => a.X != b.X ? a.X.CompareTo(b.X) : a.Y.CompareTo(b.Y));
+            foreach (var r in tiles) SendRect(px, w, r.X, r.Y, r.Right - 1, r.Bottom - 1);
+        }
+
+        static double Dist(Rectangle r, double cx, double cy)
+        {
+            double dx = r.X + r.Width / 2.0 - cx, dy = r.Y + r.Height / 2.0 - cy;
+            return dx * dx + dy * dy;
+        }
+
+        static bool SameArea(byte[] a, byte[] b, int w, int x0, int y0, int x1, int y1)
+        {
+            for (int y = y0; y <= y1; y++)
+            {
+                int i = (y * w + x0) * 2, e = (y * w + x1) * 2 + 1;
+                for (; i <= e; i++) if (a[i] != b[i]) return false;
+            }
+            return true;
         }
 
         byte[] sendBuf = new byte[0];
@@ -262,7 +329,60 @@ namespace TurzxScreen
         public static int HCount;
         static DateTime lastSample = DateTime.MinValue;
 
+        // NVML: a mesma biblioteca que o nvidia-smi usa, sem abrir um processo a cada leitura
+        [StructLayout(LayoutKind.Sequential)] struct NvUtil { public uint Gpu, Mem; }
+        [StructLayout(LayoutKind.Sequential)] struct NvMem { public ulong Total, Free, Used; }
+        [DllImport("nvml.dll")] static extern int nvmlInit_v2();
+        [DllImport("nvml.dll")] static extern int nvmlDeviceGetHandleByIndex_v2(uint i, out IntPtr dev);
+        [DllImport("nvml.dll")] static extern int nvmlDeviceGetUtilizationRates(IntPtr dev, out NvUtil u);
+        [DllImport("nvml.dll")] static extern int nvmlDeviceGetTemperature(IntPtr dev, int sensor, out uint t);
+        [DllImport("nvml.dll")] static extern int nvmlDeviceGetPowerUsage(IntPtr dev, out uint mw);
+        [DllImport("nvml.dll")] static extern int nvmlDeviceGetMemoryInfo(IntPtr dev, out NvMem m);
+        [DllImport("nvml.dll", CharSet = CharSet.Ansi)] static extern int nvmlDeviceGetName(IntPtr dev, System.Text.StringBuilder name, uint len);
+        static int nvmlState; // 0 nao tentado, 1 ok, -1 indisponivel
+        static IntPtr nvDev;
+        static readonly object gpuLock = new object();
+
+        static bool ReadNvml()
+        {
+            try
+            {
+                if (nvmlState == 0)
+                {
+                    nvmlState = nvmlInit_v2() == 0 && nvmlDeviceGetHandleByIndex_v2(0, out nvDev) == 0 ? 1 : -1;
+                    if (nvmlState < 0) return false;
+                }
+                if (nvmlState < 0) return false;
+                NvUtil u; uint t;
+                if (nvmlDeviceGetUtilizationRates(nvDev, out u) != 0 || nvmlDeviceGetTemperature(nvDev, 0, out t) != 0) return false;
+                GpuPct = u.Gpu; GpuTemp = t;
+                uint mw;
+                if (nvmlDeviceGetPowerUsage(nvDev, out mw) == 0) GpuPowerSmi = mw / 1000.0;
+                else { GpuPowerSmi = -1; GpuPowerUnsupported = true; }
+                if (!gpuInfoRead)
+                {
+                    var sb = new System.Text.StringBuilder(96); NvMem m;
+                    if (nvmlDeviceGetName(nvDev, sb, (uint)sb.Capacity) == 0) Specs.Gpu = Specs.ShortGpu(sb.ToString().Trim());
+                    if (nvmlDeviceGetMemoryInfo(nvDev, out m) == 0) Specs.GpuMem = Math.Round(m.Total / 1073741824.0) + " GB";
+                    gpuInfoRead = true;
+                }
+                return true;
+            }
+            catch (DllNotFoundException) { nvmlState = -1; return false; }
+            catch (EntryPointNotFoundException) { nvmlState = -1; return false; }
+            catch { return false; }
+        }
+
         static void ReadGpu()
+        {
+            lock (gpuLock)
+            {
+                if (ReadNvml()) return;
+                ReadGpuSmi();
+            }
+        }
+
+        static void ReadGpuSmi()
         {
             try
             {
@@ -379,7 +499,7 @@ namespace TurzxScreen
         public MainForm()
         {
             Text = "TURZX Screen"; Font = new Font("Segoe UI", 9f);
-            ClientSize = new Size(880, 582); FormBorderStyle = FormBorderStyle.FixedSingle; MaximizeBox = false;
+            ClientSize = new Size(512, 714); FormBorderStyle = FormBorderStyle.FixedSingle; MaximizeBox = false; // LayoutWindow ajusta a largura pelas abas
             StartPosition = FormStartPosition.CenterScreen;
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
             LoadSettings();
@@ -410,6 +530,18 @@ namespace TurzxScreen
             SystemEvents.PowerModeChanged += OnPowerModeChanged;
             SystemEvents.SessionEnding += OnSessionEnding;
             NotificationWatcher.Start();
+            Batteries.Low += d =>
+            {
+                if (!batWarn) return;
+                NotificationWatcher.Inject(new ToastInfo { App = "Bateria", Title = d.Name + ": " + d.Percent + "%", Body = Batteries.KindName(d.Kind) + " com bateria fraca, hora de carregar.", Time = DateTime.Now, Direct = true, Seconds = 12 });
+            };
+            Batteries.Start();
+            Vpn.Changed += (c, up) =>
+            {
+                if (!vpnToast) return;
+                NotificationWatcher.Inject(new ToastInfo { App = "VPN", Title = (up ? "Conectada: " : "Desconectada: ") + Vpn.Place(c, vpnHide), Body = Vpn.Program(c, vpnHide), Time = DateTime.Now, Direct = true, Seconds = 6 });
+            };
+            Vpn.Start();
             Widgets.Start();
             Media.Start();
             Specs.LoadAsync();
@@ -417,15 +549,15 @@ namespace TurzxScreen
             tmr.Tick += delegate
             {
                 string e = NotificationWatcher.LastError;
-                lblNotifStatus.Text = e != "" ? e : NotificationWatcher.Available ? "Lendo a central de notificacoes do Windows" : "Iniciando...";
+                lblNotifStatus.Text = e != "" ? e : NotificationWatcher.Available ? "Lendo a central de notificações do Windows" : "Iniciando...";
                 lblNotifStatus.ForeColor = e != "" ? Color.Firebrick : Color.SeaGreen;
                 if (e != "") Log.Write("notificacoes", e);
                 RgbTick();
                 SaveSettings(); // salva os ajustes logo depois de feitos
                 string air = OnAirText();
-                grpOnAir.Text = air != "" ? "No ar: " + air : "No ar (aviso de microfone e camera)";
+                grpOnAir.Text = air != "" ? "No ar: " + air : "No ar (aviso de microfone e câmera)";
             };
-            worker = new Thread(Loop); worker.IsBackground = true; worker.Start();
+            worker = new Thread(Loop); worker.IsBackground = true; worker.Priority = ThreadPriority.BelowNormal; worker.Start();
             if (Environment.GetCommandLineArgs().Length > 1 && Environment.GetCommandLineArgs()[1] == "/min")
             { WindowState = FormWindowState.Minimized; ShowInTaskbar = true; Load += delegate { Hide(); }; }
         }
@@ -443,7 +575,7 @@ namespace TurzxScreen
             textContent = cfg.Get("text", "Ola!").Replace("\\n", "\n");
             textSize = cfg.GetInt("textsize", 36);
             imageFill = cfg.GetBool("fill", true);
-            LoadCards(); specMode = cfg.GetInt("specmode", 2);
+            LoadCards(); specMode = cfg.GetInt("specmode", 2); batWarn = cfg.GetBool("batwarn", true);
             clock24 = cfg.GetBool("clock24", true);
             mirrorFollowMouse = cfg.GetBool("follow", false);
             brightness = cfg.GetInt("brightness", 50); orientation = cfg.GetInt("orientation", 2);
@@ -459,11 +591,26 @@ namespace TurzxScreen
             PhotoFrame.Recursive = cfg.GetBool("photosub", true); PhotoFrame.Shuffle = cfg.GetBool("photorand", true); PhotoFrame.ShowClock = cfg.GetBool("photoclock", true);
             Agenda.Sources = cfg.Get("calendar", ""); meetLead = cfg.GetInt("callead", 15);
             meetStrip = cfg.GetBool("calstrip", true); meetToast = cfg.GetBool("caltoast", true); meetHide = cfg.GetBool("calhide", false);
+            SF.Family = cfg.Get("screenfont", ""); lcd.Transition = cfg.GetInt("transition", 0);
+            vpnStrip = cfg.GetBool("vpnstrip", true); vpnToast = cfg.GetBool("vpntoast", true); vpnHide = cfg.GetBool("vpnhide", false);
             autoGame = cfg.GetBool("autogame", true);
             autoOn = cfg.GetBool("auto", false); autoMusic = cfg.GetBool("automusic", true);
             autoIdle = cfg.GetBool("autoidle", true); autoIdleMin = cfg.GetInt("autoidlemin", 10); autoIdleAction = cfg.GetInt("autoidleact", 0);
             autoRotate = cfg.GetBool("autorot", false); autoRotateSec = cfg.GetInt("autorotsec", 30);
             var rl = new List<int>(); foreach (var s in cfg.Get("autorotlist", "0,1,4").Split(',')) { int v; if (int.TryParse(s, out v)) rl.Add(v); }
+            // versao 2 ganhou Temperaturas e Baterias no indice 8 e 9: os temas proprios andam 2 casas
+            // versao 3 ganhou o tema VPN no indice 10
+            int themeVer = cfg.GetInt("themever", 1);
+            if (themeVer < 2)
+            {
+                if (dashTheme >= 8) dashTheme += 2;
+                for (int i = 0; i < rl.Count; i++) if (rl[i] >= 8) rl[i] += 2;
+            }
+            if (themeVer < 3)
+            {
+                if (dashTheme >= 10) dashTheme += 1;
+                for (int i = 0; i < rl.Count; i++) if (rl[i] >= 10) rl[i] += 1;
+            }
             rotateThemes = rl.ToArray();
             autoNight = cfg.GetBool("night", false); nightPct = cfg.GetInt("nightpct", 15);
             nightFrom = cfg.GetInt("nightfrom", 22); nightTo = cfg.GetInt("nightto", 7);
@@ -477,7 +624,7 @@ namespace TurzxScreen
             cfg.Set("rgbsync", rgbSync); cfg.Set("rgbprevbg", rgbPrevBg); cfg.Set("rgbprevaccent", rgbPrevAccent); cfg.Set("rgbprevfg", rgbPrevFg);
             cfg.Set("title", title); cfg.Set("bgimage", bgImagePath); cfg.Set("image", imagePath);
             cfg.Set("text", textContent.Replace("\r", "").Replace("\n", "\\n")); cfg.Set("textsize", textSize);
-            cfg.Set("fill", imageFill); cfg.Set("cards", SaveCards()); cfg.Set("specmode", specMode);
+            cfg.Set("fill", imageFill); cfg.Set("cards", SaveCards()); cfg.Set("specmode", specMode); cfg.Set("batwarn", batWarn);
             cfg.Set("clock24", clock24); cfg.Set("follow", mirrorFollowMouse); cfg.Set("brightness", brightness);
             cfg.Set("orientation", orientation); cfg.Set("screen", mirrorScreen); cfg.Set("fps", mirrorFps);
             cfg.Set("notif", notifEnabled); cfg.Set("notifhide", notifHideBody); cfg.Set("notifsec", notifSeconds); cfg.Set("notifignore", notifIgnore); cfg.Set("theme", dashTheme);
@@ -488,10 +635,12 @@ namespace TurzxScreen
             cfg.Set("photosub", PhotoFrame.Recursive); cfg.Set("photorand", PhotoFrame.Shuffle); cfg.Set("photoclock", PhotoFrame.ShowClock);
             cfg.Set("calendar", Agenda.Sources); cfg.Set("callead", meetLead);
             cfg.Set("calstrip", meetStrip); cfg.Set("caltoast", meetToast); cfg.Set("calhide", meetHide);
+            cfg.Set("screenfont", SF.IsDefault ? "" : SF.Family); cfg.Set("transition", lcd.Transition);
+            cfg.Set("vpnstrip", vpnStrip); cfg.Set("vpntoast", vpnToast); cfg.Set("vpnhide", vpnHide);
             cfg.Set("autogame", autoGame);
             cfg.Set("auto", autoOn); cfg.Set("automusic", autoMusic); cfg.Set("autoidle", autoIdle); cfg.Set("autoidlemin", autoIdleMin);
             cfg.Set("autoidleact", autoIdleAction); cfg.Set("autorot", autoRotate); cfg.Set("autorotsec", autoRotateSec);
-            var rs = new List<string>(); foreach (int t in rotateThemes) rs.Add(t.ToString()); cfg.Set("autorotlist", string.Join(",", rs.ToArray()));
+            var rs = new List<string>(); foreach (int t in rotateThemes) rs.Add(t.ToString()); cfg.Set("autorotlist", string.Join(",", rs.ToArray())); cfg.Set("themever", 3);
             cfg.Set("night", autoNight); cfg.Set("nightpct", nightPct); cfg.Set("nightfrom", nightFrom); cfg.Set("nightto", nightTo);
             cfg.Set("city", Widgets.City); cfg.Set("quotes", Widgets.QuoteList);
             cfg.Save();
@@ -538,34 +687,30 @@ namespace TurzxScreen
 
         void BuildUi()
         {
-            preview = Add(new PictureBox(), 380, 12, 488, this);
-            preview.Height = 328; preview.BorderStyle = BorderStyle.FixedSingle; preview.SizeMode = PictureBoxSizeMode.Zoom; preview.BackColor = Color.Black;
-            status = (Label)L("Procurando a tela...", 380, 348, this);
-            var hint = L("Velocidade da tela: ~0,5 quadro/s em tela cheia. O app envia so o que muda.", 380, 370, this);
-            hint.ForeColor = Color.Gray;
+            // previa em cima, barra de status, abas embaixo (uma linha so; a janela alarga junto)
+            preview = Add(new PictureBox(), 12, 12, PreviewW, this);
+            preview.Height = PreviewH; preview.BorderStyle = BorderStyle.None; preview.SizeMode = PictureBoxSizeMode.Zoom; preview.BackColor = Color.Black;
+            statusDot = (Label)L("●", 10, PreviewH + 15, this); statusDot.ForeColor = Color.Orange; statusDot.Font = new Font("Segoe UI", 12f);
+            status = (Label)L("Procurando a tela...", 28, PreviewH + 18, this);
+            lblNow = (Label)L("", 0, PreviewH + 18, this); lblNow.AutoSize = false; lblNow.TextAlign = ContentAlignment.TopRight; lblNow.ForeColor = Color.Gray; lblNow.Width = 300;
+            var tip = new ToolTip();
+            tip.SetToolTip(status, "Velocidade da tela: ~0,5 quadro/s em tela cheia. O app envia só o que muda.");
+            tip.SetToolTip(preview, "Prévia do que está na tela USB");
 
-            var g = Add(new GroupBox(), 12, 8, 356, this); g.Text = "Tela"; g.Height = 110;
-            L("Brilho", 10, 22, g);
-            trkBright = Add(new TrackBar(), 70, 18, 270, g); trkBright.Minimum = 0; trkBright.Maximum = 100; trkBright.TickFrequency = 10; trkBright.Value = brightness;
-            trkBright.ValueChanged += delegate { brightness = trkBright.Value; appliedBrightness = -1; };
-            L("Orientacao", 10, 70, g);
-            cboOrient = Add(new ComboBox(), 80, 68, 140, g); cboOrient.DropDownStyle = ComboBoxStyle.DropDownList;
-            cboOrient.Items.AddRange(new object[] { "Retrato", "Retrato invertido", "Paisagem", "Paisagem invertida" });
-            cboOrient.SelectedIndex = orientation;
-            cboOrient.SelectedIndexChanged += delegate { orientation = cboOrient.SelectedIndex; needConfig = true; };
-            Btn("Desligar", 228, 67, 55, g, delegate { Safe(delegate { lcd.ScreenOn(false); }); });
-            Btn("Ligar", 287, 67, 55, g, delegate { Safe(delegate { lcd.ScreenOn(true); lcd.Invalidate(); }); });
-
-            tabs = Add(new TabControl(), 12, 124, 356, this); tabs.Height = 326;
+            tabs = Add(new TabControl(), 12, PreviewH + 46, PreviewW, this); tabs.Height = TabsH;
+            tabs.Multiline = false; tabs.Padding = new Point(10, 4);
             var tp = new TabPage("Painel"); var ti = new TabPage("Imagem / GIF"); var tm = new TabPage("Espelhar tela"); var tt = new TabPage("Texto");
-            var tc = new TabPage("Cartoes");
+            var tc = new TabPage("Cartões");
             var ta = new TabPage("Auto");
             var tg = new TabPage("Agenda");
+            var tv = new TabPage("VPN");
+            var tw = new TabPage("Geral");
             ti.Text = "Imagem"; tm.Text = "Espelho";
-            tabs.Padding = new Point(3, 3); // 7 abas precisam caber sem setas
-            tabs.TabPages.AddRange(new[] { tp, ti, tm, tt, tc, ta, tg });
+            tabs.TabPages.AddRange(new[] { tp, ti, tm, tt, tc, ta, tg, tv, tw });
             BuildCardsTab(tc);
             BuildAgendaTab(tg);
+            BuildVpnTab(tv);
+            BuildGeneralTab(tw);
             tabs.SelectedIndex = mode;
             // a aba Automatico nao e um modo: so as 4 primeiras escolhem o que mostrar
             tabs.SelectedIndexChanged += delegate { if (tabs.SelectedIndex < 4) { mode = tabs.SelectedIndex; lcd.Invalidate(); } };
@@ -576,12 +721,13 @@ namespace TurzxScreen
                 else if (args[i] == "/themeshots") { string shotDir = args[i + 1]; Load += delegate { ThemeShots(shotDir); }; }
                 else if (args[i] == "/framedump") frameDumpDir = args[i + 1];
                 else if (args[i] == "/framecount") int.TryParse(args[i + 1], out frameDumpLeft);
+                else if (args[i] == "/batlog") Batteries.Debug = true;
                 else if (args[i] == "/gamepid") { int gp; if (int.TryParse(args[i + 1], out gp)) Gaming.ForcePid = gp; }
                 else if (args[i] == "/testonair") { int secs; if (int.TryParse(args[i + 1], out secs)) OnAir.TestUntil = DateTime.Now.AddSeconds(secs); }
                 else if (args[i] == "/tab") { int ti2; if (int.TryParse(args[i + 1], out ti2) && ti2 >= 0 && ti2 < tabs.TabCount) tabs.SelectedIndex = ti2; }
 
             // painel
-            L("Titulo", 10, 12, tp);
+            L("Título", 10, 12, tp);
             txtTitle = Add(new TextBox(), 70, 12, 260, tp); txtTitle.Text = title; txtTitle.TextChanged += delegate { title = txtTitle.Text; };
             btnBg = Btn("Fundo", 10, 44, 100, tp, delegate { PickColor(ref bgColor, btnBg); });
             btnAccent = Btn("Destaque", 118, 44, 100, tp, delegate { PickColor(ref accent, btnAccent); });
@@ -608,7 +754,7 @@ namespace TurzxScreen
             };
             lblPanelHint = (Label)L(PanelHint, 10, 140, tp); lblPanelHint.ForeColor = Color.Gray;
             lblPanelHint.AutoSize = false; lblPanelHint.Width = 326; lblPanelHint.AutoEllipsis = true;
-            chk24 = Chk("Relogio 24h", clock24, 10, 166, tp, delegate { clock24 = chk24.Checked; });
+            chk24 = Chk("Relógio 24h", clock24, 10, 166, tp, delegate { clock24 = chk24.Checked; });
             chkRgb = Chk("Cores do RGB (SignalRGB)", rgbSync, 130, 166, tp, delegate { if (!syncingRgb) SetRgbSync(chkRgb.Checked); });
             L("Tema", 10, 200, tp);
             cboTheme = Add(new ComboBox(), 70, 198, 200, tp); cboTheme.DropDownStyle = ComboBoxStyle.DropDownList;
@@ -621,7 +767,7 @@ namespace TurzxScreen
             var txtCity = Add(new TextBox(), 70, 230, 200, tp); txtCity.Text = Widgets.City;
             txtCity.Leave += delegate { Widgets.City = txtCity.Text; };
             txtCity.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { Widgets.City = txtCity.Text; e.SuppressKeyPress = true; } };
-            L("Cotacoes", 10, 262, tp);
+            L("Cotações", 10, 262, tp);
             var txtQuotes = Add(new TextBox(), 70, 260, 200, tp); txtQuotes.Text = Widgets.QuoteList;
             txtQuotes.Leave += delegate { Widgets.QuoteList = txtQuotes.Text; };
             Btn("Atualizar", 276, 244, 60, tp, delegate { Widgets.City = txtCity.Text; Widgets.QuoteList = txtQuotes.Text; Widgets.RefreshNow(); });
@@ -630,7 +776,7 @@ namespace TurzxScreen
             Btn("Escolher imagem ou GIF...", 10, 12, 180, ti, delegate { var p = Open("Imagens|*.png;*.jpg;*.jpeg;*.bmp;*.gif"); if (p != null) { imagePath = p; LoadImage(); lblImage.Text = Path.GetFileName(p); lcd.Invalidate(); } });
             lblImage = (Label)L(imagePath == "" ? "(nenhuma)" : Path.GetFileName(imagePath), 10, 46, ti);
             chkFill = Chk("Preencher a tela (corta as bordas)", imageFill, 10, 70, ti, delegate { imageFill = chkFill.Checked; });
-            var n1 = L("GIFs animados funcionam, mas a tela e lenta:\nGIFs pequenos ou com pouca mudanca ficam melhores.", 10, 98, ti); n1.ForeColor = Color.Gray;
+            var n1 = L("GIFs animados funcionam, mas a tela é lenta:\nGIFs pequenos ou com pouca mudança ficam melhores.", 10, 98, ti); n1.ForeColor = Color.Gray;
 
             // porta-retrato
             CheckBox cPh = null, cSub = null, cRand = null, cClock = null;
@@ -652,9 +798,9 @@ namespace TurzxScreen
             nSec.ValueChanged += delegate { PhotoFrame.Seconds = (int)nSec.Value; };
             L("s", 151, 200, ti);
             cSub = Chk("Incluir subpastas", PhotoFrame.Recursive, 190, 200, ti, delegate { PhotoFrame.Recursive = cSub.Checked; });
-            cRand = Chk("Ordem aleatoria", PhotoFrame.Shuffle, 10, 228, ti, delegate { PhotoFrame.Shuffle = cRand.Checked; });
-            cClock = Chk("Relogio sobre a foto", PhotoFrame.ShowClock, 190, 228, ti, delegate { PhotoFrame.ShowClock = cClock.Checked; });
-            Btn("Proxima foto", 10, 254, 100, ti, delegate { PhotoFrame.Next(); });
+            cRand = Chk("Ordem aleatória", PhotoFrame.Shuffle, 10, 228, ti, delegate { PhotoFrame.Shuffle = cRand.Checked; });
+            cClock = Chk("Relógio sobre a foto", PhotoFrame.ShowClock, 190, 228, ti, delegate { PhotoFrame.ShowClock = cClock.Checked; });
+            Btn("Próxima foto", 10, 254, 100, ti, delegate { PhotoFrame.Next(); });
             var lblPh = (Label)L("", 118, 258, ti); lblPh.AutoSize = false; lblPh.Width = 218; lblPh.AutoEllipsis = true; lblPh.ForeColor = Color.SeaGreen;
             var tmPh = new System.Windows.Forms.Timer(); tmPh.Interval = 1500; tmPh.Start();
             tmPh.Tick += delegate { lblPh.Text = PhotoFrame.Enabled ? PhotoFrame.Status : ""; };
@@ -666,10 +812,10 @@ namespace TurzxScreen
             cboScreen.SelectedIndex = Math.Min(mirrorScreen, cboScreen.Items.Count - 1);
             cboScreen.SelectedIndexChanged += delegate { mirrorScreen = cboScreen.SelectedIndex; };
             chkFollow = Chk("Seguir o mouse (lupa 1:1 ao redor do cursor)", mirrorFollowMouse, 10, 44, tm, delegate { mirrorFollowMouse = chkFollow.Checked; });
-            L("Quadros/s max.", 10, 74, tm);
+            L("Quadros/s máx.", 10, 74, tm);
             numFps = Add(new NumericUpDown(), 110, 72, 60, tm); numFps.Minimum = 1; numFps.Maximum = 10; numFps.Value = Math.Max(1, Math.Min(10, mirrorFps));
             numFps.ValueChanged += delegate { mirrorFps = (int)numFps.Value; };
-            var n2 = L("Nao e um monitor de verdade (o Windows nao ve a tela como\nvideo). O app captura a imagem e envia. Funciona bem\npara conteudo que muda pouco.", 10, 106, tm); n2.ForeColor = Color.Gray;
+            var n2 = L("Não é um monitor de verdade (o Windows não vê a tela como\nvídeo). O app captura a imagem e envia. Funciona bem\npara conteúdo que muda pouco.", 10, 106, tm); n2.ForeColor = Color.Gray;
 
             // texto
             txtText = Add(new TextBox(), 10, 12, 326, tt); txtText.Multiline = true; txtText.Height = 160; txtText.ScrollBars = ScrollBars.Vertical;
@@ -678,46 +824,112 @@ namespace TurzxScreen
             numTextSize = Add(new NumericUpDown(), 70, 182, 60, tt); numTextSize.Minimum = 10; numTextSize.Maximum = 120; numTextSize.Value = Math.Max(10, Math.Min(120, textSize));
             numTextSize.ValueChanged += delegate { textSize = (int)numTextSize.Value; };
 
-            // notificacoes
-            var gn = Add(new GroupBox(), 380, 396, 488, this); gn.Text = "Notificacoes do Windows (Teams, WhatsApp, e-mail...)"; gn.Height = 150;
-            chkNotif = Chk("Mostrar notificacoes na tela", notifEnabled, 10, 22, gn, delegate { notifEnabled = chkNotif.Checked; });
-            chkNotifHide = Chk("Privacidade: esconder o texto da mensagem", notifHideBody, 220, 22, gn, delegate { notifHideBody = chkNotifHide.Checked; });
-            L("Mostrar por", 10, 52, gn);
-            numNotifSec = Add(new NumericUpDown(), 85, 50, 50, gn); numNotifSec.Minimum = 3; numNotifSec.Maximum = 60; numNotifSec.Value = Math.Max(3, Math.Min(60, notifSeconds));
-            numNotifSec.ValueChanged += delegate { notifSeconds = (int)numNotifSec.Value; };
-            L("segundos", 140, 52, gn);
-            Btn("Testar", 400, 48, 76, gn, delegate
-            {
-                var t = new ToastInfo(); t.App = "Microsoft Teams"; t.Title = "Maria Silva";
-                t.Body = "Oi! Voce consegue dar uma olhada no relatorio antes da reuniao das 15h?"; t.Time = DateTime.Now; t.Icon = Icon.ToBitmap();
-                NotificationWatcher.Inject(t);
-            });
-            L("Ignorar apps (separe por virgula):", 10, 82, gn);
-            txtNotifIgnore = Add(new TextBox(), 210, 80, 266, gn); txtNotifIgnore.Text = notifIgnore;
-            txtNotifIgnore.TextChanged += delegate { notifIgnore = txtNotifIgnore.Text; };
-            chkMusicToast = Chk("Avisar quando trocar de musica (fora do tema Tocando agora)", musicToast, 10, 106, gn, delegate { musicToast = chkMusicToast.Checked; });
-            lblNotifStatus = (Label)L("Iniciando...", 10, 126, gn);
+            LayoutWindow();
+        }
 
-            chkStartup = Chk("Iniciar com o Windows (minimizado)", IsStartup(), 12, 460, this, delegate { SetStartup(chkStartup.Checked); });
-            Btn("Reconectar", 260, 456, 108, this, delegate { lock (lcdLock) lcd.Close(); });
+        const int PreviewW = 488, PreviewH = 326, TabsH = 330;
+        Label statusDot, lblNow;
+
+        // a largura acompanha as abas; o conteudo de cada aba fica centralizado e rola na vertical
+        void LayoutWindow()
+        {
+            int strip = 8;
+            foreach (TabPage p in tabs.TabPages) strip += TextRenderer.MeasureText(p.Text, tabs.Font).Width + tabs.Padding.X * 2 + 4;
+            int w = Math.Max(PreviewW, strip);
+            ClientSize = new Size(w + 24, PreviewH + 46 + TabsH + 12);
+            preview.Left = 12 + (w - PreviewW) / 2;
+            tabs.Width = w;
+            lblNow.Left = 12 + w - lblNow.Width;
+            int inner = w - 8;
+            foreach (TabPage p in tabs.TabPages)
+            {
+                p.AutoScroll = true;
+                int right = 0;
+                foreach (Control c in p.Controls) right = Math.Max(right, c.Right);
+                int dx = Math.Max(0, (inner - SystemInformation.VerticalScrollBarWidth - right - 10) / 2);
+                if (dx > 0) foreach (Control c in p.Controls) c.Left += dx;
+            }
+        }
+
+        // configuracoes gerais: tela, inicio, fonte, API, faixa de status e No ar
+        void BuildGeneralTab(TabPage t)
+        {
+            var g = Add(new GroupBox(), 6, 4, 334, t); g.Text = "Tela"; g.Height = 94;
+            L("Brilho", 10, 20, g);
+            trkBright = Add(new TrackBar(), 70, 16, 254, g); trkBright.Minimum = 0; trkBright.Maximum = 100; trkBright.TickFrequency = 10; trkBright.Value = brightness;
+            trkBright.ValueChanged += delegate { brightness = trkBright.Value; appliedBrightness = -1; };
+            L("Orientação", 10, 60, g);
+            cboOrient = Add(new ComboBox(), 80, 58, 122, g); cboOrient.DropDownStyle = ComboBoxStyle.DropDownList;
+            cboOrient.Items.AddRange(new object[] { "Retrato", "Retrato invertido", "Paisagem", "Paisagem invertida" });
+            cboOrient.SelectedIndex = orientation;
+            cboOrient.SelectedIndexChanged += delegate { orientation = cboOrient.SelectedIndex; needConfig = true; };
+            Btn("Desligar", 206, 57, 64, g, delegate { Safe(delegate { lcd.ScreenOn(false); }); });
+            Btn("Ligar", 274, 57, 50, g, delegate { Safe(delegate { lcd.ScreenOn(true); lcd.Invalidate(); }); });
+
+            chkStartup = Chk("Iniciar com o Windows (minimizado)", IsStartup(), 10, 106, t, delegate { SetStartup(chkStartup.Checked); });
+            Btn("Reconectar a tela", 220, 102, 120, t, delegate { lock (lcdLock) lcd.Close(); });
+
+            L("Fonte da tela", 10, 136, t);
+            var cbFont = Add(new ComboBox(), 100, 134, 240, t); cbFont.DropDownStyle = ComboBoxStyle.DropDownList; cbFont.MaxDropDownItems = 16;
+            cbFont.Items.Add(SF.Default + " (padrão)");
+            foreach (var n in SF.List()) if (!n.Equals(SF.Default, StringComparison.OrdinalIgnoreCase)) cbFont.Items.Add(n);
+            int fi = SF.IsDefault ? 0 : cbFont.Items.IndexOf(SF.Family);
+            cbFont.SelectedIndex = Math.Max(0, fi);
+            var sample = (Label)L("12:34  CPU 45%  Escritório", 100, 158, t);
+            sample.AutoSize = false; sample.Width = 240; sample.Height = 22; sample.ForeColor = Color.DimGray;
+            Action showSample = delegate
+            {
+                try { var old = sample.Font; sample.Font = new Font(SF.Family, 12f); if (old != Font) old.Dispose(); } catch { }
+            };
+            showSample();
+            cbFont.SelectedIndexChanged += delegate
+            {
+                SF.Family = cbFont.SelectedIndex <= 0 ? "" : (string)cbFont.SelectedItem;
+                showSample(); lcd.Invalidate(); // a tela toda e redesenhada na fonte nova
+            };
+
+            L("Transição", 10, 186, t);
+            var cbTr = Add(new ComboBox(), 100, 184, 240, t); cbTr.DropDownStyle = ComboBoxStyle.DropDownList;
+            cbTr.Items.AddRange(Lcd.TransitionNames);
+            cbTr.SelectedIndex = Math.Max(0, Math.Min(Lcd.TransitionNames.Length - 1, lcd.Transition));
+            cbTr.SelectedIndexChanged += delegate { lcd.Transition = cbTr.SelectedIndex; };
 
             CheckBox cApi = null, cStrip = null;
-            cApi = Chk("API local (porta " + ApiServer.Port + ")", apiEnabled, 382, 553, this, delegate
+            cApi = Chk("API local (porta " + ApiServer.Port + ")", apiEnabled, 10, 218, t, delegate
             {
                 apiEnabled = cApi.Checked;
                 if (apiEnabled) ApiServer.Start(); else ApiServer.Stop();
             });
-            cStrip = Chk("Faixa de status (Claude Code)", StatusBoard.Show, 545, 553, this, delegate { StatusBoard.Show = cStrip.Checked; });
-            Btn("Copiar token", 768, 550, 100, this, delegate { if (ApiServer.Token != "") Clipboard.SetText(ApiServer.Token); });
+            Btn("Copiar token", 220, 214, 120, t, delegate { if (ApiServer.Token != "") Clipboard.SetText(ApiServer.Token); });
+            cStrip = Chk("Faixa de status (Claude Code, reunião, VPN)", StatusBoard.Show, 10, 242, t, delegate { StatusBoard.Show = cStrip.Checked; });
 
-            grpOnAir = Add(new GroupBox(), 12, 486, 356, this); grpOnAir.Text = "No ar (aviso de microfone e camera)"; grpOnAir.Height = 76;
+            grpOnAir = Add(new GroupBox(), 6, 266, 334, t); grpOnAir.Text = "No ar (aviso de microfone e câmera)"; grpOnAir.Height = 70;
             CheckBox cMic = null, cCam = null;
-            cMic = Chk("Microfone", OnAir.WatchMic, 10, 20, grpOnAir, delegate { OnAir.WatchMic = cMic.Checked; });
-            cCam = Chk("Camera", OnAir.WatchCam, 100, 20, grpOnAir, delegate { OnAir.WatchCam = cCam.Checked; });
-            Btn("Testar", 262, 16, 82, grpOnAir, delegate { OnAir.TestUntil = DateTime.Now.AddSeconds(10); });
-            L("Ignorar", 10, 46, grpOnAir);
-            var txtAir = Add(new TextBox(), 66, 45, 278, grpOnAir); txtAir.Text = OnAir.Ignore;
+            cMic = Chk("Microfone", OnAir.WatchMic, 10, 18, grpOnAir, delegate { OnAir.WatchMic = cMic.Checked; });
+            cCam = Chk("Câmera", OnAir.WatchCam, 100, 18, grpOnAir, delegate { OnAir.WatchCam = cCam.Checked; });
+            Btn("Testar", 244, 14, 80, grpOnAir, delegate { OnAir.TestUntil = DateTime.Now.AddSeconds(10); });
+            L("Ignorar", 10, 42, grpOnAir);
+            var txtAir = Add(new TextBox(), 66, 41, 258, grpOnAir); txtAir.Text = OnAir.Ignore;
             txtAir.TextChanged += delegate { OnAir.Ignore = txtAir.Text; };
+
+            var gn = Add(new GroupBox(), 6, 340, 334, t); gn.Text = "Notificações do Windows (Teams, WhatsApp, e-mail...)"; gn.Height = 166;
+            chkNotif = Chk("Mostrar notificações na tela", notifEnabled, 10, 18, gn, delegate { notifEnabled = chkNotif.Checked; });
+            chkNotifHide = Chk("Privacidade: esconder o texto da mensagem", notifHideBody, 10, 40, gn, delegate { notifHideBody = chkNotifHide.Checked; });
+            L("Mostrar por", 10, 66, gn);
+            numNotifSec = Add(new NumericUpDown(), 85, 64, 50, gn); numNotifSec.Minimum = 3; numNotifSec.Maximum = 60; numNotifSec.Value = Math.Max(3, Math.Min(60, notifSeconds));
+            numNotifSec.ValueChanged += delegate { notifSeconds = (int)numNotifSec.Value; };
+            L("segundos", 140, 66, gn);
+            Btn("Testar", 244, 62, 80, gn, delegate
+            {
+                var n = new ToastInfo(); n.App = "Microsoft Teams"; n.Title = "Maria Silva";
+                n.Body = "Oi! Voce consegue dar uma olhada no relatorio antes da reuniao das 15h?"; n.Time = DateTime.Now; n.Icon = Icon.ToBitmap();
+                NotificationWatcher.Inject(n);
+            });
+            L("Ignorar apps", 10, 94, gn);
+            txtNotifIgnore = Add(new TextBox(), 90, 92, 234, gn); txtNotifIgnore.Text = notifIgnore;
+            txtNotifIgnore.TextChanged += delegate { notifIgnore = txtNotifIgnore.Text; };
+            chkMusicToast = Chk("Avisar quando trocar de música (fora do Tocando agora)", musicToast, 10, 120, gn, delegate { musicToast = chkMusicToast.Checked; });
+            lblNotifStatus = (Label)L("Iniciando...", 10, 140, gn);
         }
 
         void Paint3()
@@ -746,7 +958,7 @@ namespace TurzxScreen
         }
 
         // ---------------- cores do RGB do PC (SignalRGB)
-        const string PanelHint = "Cartoes, ordem e especificacoes: aba Cartoes";
+        const string PanelHint = "Cartões, ordem e especificações: aba Cartões";
         bool rgbSync, syncingRgb; int rgbLast = -1;
         Color rgbPrevBg, rgbPrevAccent, rgbPrevFg;
         CheckBox chkRgb; Label lblPanelHint;
@@ -857,7 +1069,19 @@ namespace TurzxScreen
         }
 
         void Safe(Action a) { lock (lcdLock) { try { if (lcd.IsOpen) a(); } catch (Exception ex) { SetStatus("Erro: " + ex.Message); lcd.Close(); } } }
-        void SetStatus(string s) { try { BeginInvoke((Action)delegate { status.Text = s; }); } catch { } }
+        void SetStatus(string s)
+        {
+            try
+            {
+                BeginInvoke((Action)delegate
+                {
+                    status.Text = s;
+                    statusDot.ForeColor = s.StartsWith("Conectado") ? Color.FromArgb(76, 199, 120)
+                        : s.StartsWith("Erro") || s.Contains("não encontrada") || s.Contains("em uso") ? Color.Firebrick : Color.Orange;
+                });
+            }
+            catch { }
+        }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
@@ -901,7 +1125,7 @@ namespace TurzxScreen
                 lock (lcdLock) lcd.Close();
                 needConfig = true; reconnectNow = true;
                 suspended = false;   // o loop reconecta, religa a tela e redesenha tudo
-                SetStatus("Voltando da suspensao: reconectando...");
+                SetStatus("Voltando da suspensão: reconectando...");
             }
         }
 
@@ -942,6 +1166,8 @@ namespace TurzxScreen
             if (--frameDumpLeft == 0) BeginInvoke((Action)delegate { Close(); });
         }
 
+        bool lowPriority;
+
         void Loop()
         {
             DateTime nextTry = DateTime.MinValue;
@@ -957,7 +1183,7 @@ namespace TurzxScreen
                 {
                     nextTry = DateTime.Now.AddSeconds(3);
                     string port = Lcd.FindPort();
-                    if (port == null) SetStatus("Tela nao encontrada. Verifique o cabo USB.");
+                    if (port == null) SetStatus("Tela não encontrada. Verifique o cabo USB.");
                     else
                     {
                         try { lock (lcdLock) { if (suspended) continue; lcd.Open(port); } needConfig = true; SetStatus("Conectado em " + port); }
@@ -987,6 +1213,13 @@ namespace TurzxScreen
                     catch { }
                 }
                 if (effMode != lastEffMode || effTheme != lastEffTheme) { lastEffMode = effMode; lastEffTheme = effTheme; SetAutoStatus(effMode, effTheme); }
+                // jogo aberto: o app cede a vez ao jogo em qualquer disputa de CPU
+                bool gaming = Gaming.Active;
+                if (gaming != lowPriority)
+                {
+                    lowPriority = gaming;
+                    try { using (var me = Process.GetCurrentProcess()) me.PriorityClass = gaming ? ProcessPriorityClass.BelowNormal : ProcessPriorityClass.Normal; } catch { }
+                }
                 if (idleOff) { SysInfo.Update(true); Thread.Sleep(500); continue; }
                 try
                 {
@@ -1003,7 +1236,7 @@ namespace TurzxScreen
                         g.Clear(Color.Black);
                         g.SmoothingMode = SmoothingMode.AntiAlias; g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
                         g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                        TickMeetings();
+                        TickMeetings(); TickVpn();
                         int stripCount;
                         stripInset = StatusBoard.Show && StatusBoard.Top(out stripCount) != null ? 22 : 0;
                         switch (effMode)
@@ -1069,7 +1302,7 @@ namespace TurzxScreen
                         catch (Exception ex)
                         {
                             Log.Error("tela", ex);
-                            SetStatus("Conexao perdida (" + ex.Message + "). Reconectando...");
+                            SetStatus("Conexão perdida (" + ex.Message + "). Reconectando...");
                             lcd.Close(); nextTry = DateTime.Now.AddSeconds(2);
                         }
                     }
@@ -1099,7 +1332,8 @@ namespace TurzxScreen
         }
 
         // temas prontos; os criados no editor vem depois deles (indice 8 em diante)
-        static readonly string[] ThemeNames = { "Cartões", "Gráficos (histórico)", "Relógio grande", "Medidores", "Clima e cotações", "Tocando agora (música)", "Gaming (FPS)", "Agenda" };
+        static readonly string[] ThemeNames = { "Cartões", "Gráficos (histórico)", "Relógio grande", "Medidores", "Clima e cotações", "Tocando agora (música)", "Gaming (FPS)", "Agenda", "Temperaturas", "Baterias", "VPN" };
+        const int VpnTheme = 10;
         CheckedListBox rotateList; bool syncTheme;
 
         static string[] AllThemeNames()
@@ -1117,11 +1351,47 @@ namespace TurzxScreen
             dashTheme = Math.Max(0, Math.Min(names.Length - 1, dashTheme));
             cboTheme.SelectedIndex = dashTheme; cboTheme.EndUpdate();
             syncTheme = false;
+            FillRotateList();
+        }
+
+        class RotItem { public int Index; public string Name; public override string ToString() { return Name; } }
+        bool fillingRot;
+
+        // marcados primeiro, na ordem do rodizio; depois os outros na ordem normal
+        void FillRotateList()
+        {
             if (rotateList == null) return;
-            var rt = rotateThemes;
-            rotateList.BeginUpdate(); rotateList.Items.Clear(); rotateList.Items.AddRange(names);
-            foreach (int t in rt) if (t >= 0 && t < names.Length) rotateList.SetItemChecked(t, true);
+            var names = AllThemeNames(); var rt = rotateThemes;
+            fillingRot = true;
+            rotateList.BeginUpdate(); rotateList.Items.Clear();
+            var used = new HashSet<int>();
+            foreach (int t in rt)
+                if (t >= 0 && t < names.Length && used.Add(t)) rotateList.Items.Add(new RotItem { Index = t, Name = names[t] }, true);
+            for (int t = 0; t < names.Length; t++)
+                if (!used.Contains(t)) rotateList.Items.Add(new RotItem { Index = t, Name = names[t] }, false);
             rotateList.EndUpdate();
+            fillingRot = false;
+        }
+
+        void ReadRotateList()
+        {
+            var sel = new List<int>();
+            for (int i = 0; i < rotateList.Items.Count; i++)
+                if (rotateList.GetItemChecked(i)) sel.Add(((RotItem)rotateList.Items[i]).Index);
+            rotateThemes = sel.ToArray();
+        }
+
+        void MoveRotate(int dir)
+        {
+            int i = rotateList.SelectedIndex, j = i + dir;
+            if (i < 0 || j < 0 || j >= rotateList.Items.Count) return;
+            object a = rotateList.Items[i]; bool ca = rotateList.GetItemChecked(i), cb = rotateList.GetItemChecked(j);
+            fillingRot = true;
+            rotateList.Items[i] = rotateList.Items[j]; rotateList.SetItemChecked(i, cb);
+            rotateList.Items[j] = a; rotateList.SetItemChecked(j, ca);
+            rotateList.SelectedIndex = j;
+            fillingRot = false;
+            ReadRotateList();
         }
         static readonly string[] ModeNames = { "Painel", "Imagem / GIF", "Espelhar tela", "Texto" };
 
@@ -1168,40 +1438,37 @@ namespace TurzxScreen
         {
             var names = AllThemeNames();
             string s = "Mostrando agora: " + (m == 0 ? "Painel - " + names[Math.Max(0, Math.Min(names.Length - 1, t))] : ModeNames[Math.Min(3, m)]);
-            try { BeginInvoke((Action)delegate { if (lblAuto != null) lblAuto.Text = s; }); } catch { }
+            try { BeginInvoke((Action)delegate { if (lblAuto != null) lblAuto.Text = s; if (lblNow != null) lblNow.Text = s; }); } catch { }
         }
 
         void BuildAutoTab(TabPage ta)
         {
             CheckBox cOn = null, cMus = null, cIdle = null, cRot = null, cNight = null;
-            cOn = Chk("Ativar troca automatica", autoOn, 10, 8, ta, delegate { autoOn = cOn.Checked; appliedBrightness = -1; });
+            cOn = Chk("Ativar troca automática", autoOn, 10, 8, ta, delegate { autoOn = cOn.Checked; appliedBrightness = -1; });
             cOn.Font = new Font(Font, FontStyle.Bold);
             CheckBox cGame = null;
             cGame = Chk("Jogo aberto -> Gaming", autoGame, 190, 8, ta, delegate { autoGame = cGame.Checked; });
-            cMus = Chk("Musica tocando -> tema Tocando agora", autoMusic, 10, 34, ta, delegate { autoMusic = cMus.Checked; });
+            cMus = Chk("Música tocando -> tema Tocando agora", autoMusic, 10, 34, ta, delegate { autoMusic = cMus.Checked; });
 
             cIdle = Chk("PC parado por", autoIdle, 10, 62, ta, delegate { autoIdle = cIdle.Checked; });
             var nIdle = Add(new NumericUpDown(), 112, 60, 48, ta); nIdle.Minimum = 1; nIdle.Maximum = 240; nIdle.Value = Math.Max(1, Math.Min(240, autoIdleMin));
             nIdle.ValueChanged += delegate { autoIdleMin = (int)nIdle.Value; };
             L("min ->", 164, 62, ta);
             var cbIdle = Add(new ComboBox(), 208, 60, 128, ta); cbIdle.DropDownStyle = ComboBoxStyle.DropDownList;
-            cbIdle.Items.AddRange(new object[] { "Relogio grande", "Imagem / fotos", "Desligar a tela" });
+            cbIdle.Items.AddRange(new object[] { "Relógio grande", "Imagem / fotos", "Desligar a tela" });
             cbIdle.SelectedIndex = Math.Max(0, Math.Min(2, autoIdleAction));
             cbIdle.SelectedIndexChanged += delegate { autoIdleAction = cbIdle.SelectedIndex; };
 
             cRot = Chk("Alternar temas a cada", autoRot(), 10, 92, ta, delegate { autoRotate = cRot.Checked; });
             var nRot = Add(new NumericUpDown(), 160, 90, 52, ta); nRot.Minimum = 5; nRot.Maximum = 3600; nRot.Value = Math.Max(5, Math.Min(3600, autoRotateSec));
             nRot.ValueChanged += delegate { autoRotateSec = (int)nRot.Value; };
-            L("segundos:", 216, 92, ta);
-            var list = Add(new CheckedListBox(), 28, 116, 308, ta); list.Height = 68; list.MultiColumn = true; list.ColumnWidth = 150; list.CheckOnClick = true;
+            L("segundos, nesta ordem:", 216, 92, ta);
+            var list = Add(new CheckedListBox(), 28, 114, 270, ta); list.Height = 76; list.CheckOnClick = true; list.IntegralHeight = false;
             rotateList = list;
-            list.Items.AddRange(AllThemeNames());
-            foreach (int t in rotateThemes) if (t >= 0 && t < list.Items.Count) list.SetItemChecked(t, true);
-            list.ItemCheck += (s, e) => BeginInvoke((Action)delegate
-            {
-                var sel = new List<int>(); foreach (int i in list.CheckedIndices) sel.Add(i);
-                rotateThemes = sel.ToArray();
-            });
+            FillRotateList();
+            list.ItemCheck += (s, e) => { if (!fillingRot) BeginInvoke((Action)ReadRotateList); };
+            Btn("▲", 304, 114, 32, ta, delegate { MoveRotate(-1); });
+            Btn("▼", 304, 152, 32, ta, delegate { MoveRotate(1); });
 
             cNight = Chk("Brilho noturno", autoNight, 10, 196, ta, delegate { autoNight = cNight.Checked; appliedBrightness = -1; });
             var nPct = Add(new NumericUpDown(), 120, 194, 46, ta); nPct.Minimum = 0; nPct.Maximum = 100; nPct.Value = Math.Max(0, Math.Min(100, nightPct));
@@ -1215,7 +1482,7 @@ namespace TurzxScreen
             L("h", 318, 196, ta);
 
             lblAuto = (Label)L("", 10, 232, ta); lblAuto.ForeColor = Color.SeaGreen;
-            var hint = L("Prioridade: jogo > PC parado > musica > rodizio > modo.\nAs notificacoes aparecem por cima de tudo.", 10, 256, ta);
+            var hint = L("Prioridade: jogo > PC parado > música > rodízio > modo.\nAs notificações aparecem por cima de tudo.", 10, 256, ta);
             hint.ForeColor = Color.Gray;
         }
         bool autoRot() { return autoRotate; }
@@ -1258,6 +1525,9 @@ namespace TurzxScreen
                 case 5: DrawMusic(g, w, h); return;
                 case 6: DrawGaming(g, w, h); return;
                 case 7: DrawAgenda(g, w, h); return;
+                case 8: DrawTemps(g, w, h); return;
+                case 9: DrawBatteries(g, w, h); return;
+                case VpnTheme: DrawVpnTheme(g, w, h); return;
                 default: DrawCards(g, w, h); return;
             }
         }
@@ -1269,8 +1539,8 @@ namespace TurzxScreen
         // cabecalho compacto: hora a esquerda, data e titulo a direita
         int DrawHeader(Graphics g, int w, Brush fg, Brush dim, Brush acc)
         {
-            using (var fT = new Font("Segoe UI Semibold", 34, GraphicsUnit.Pixel))
-            using (var fS = new Font("Segoe UI", 14, GraphicsUnit.Pixel))
+            using (var fT = SF.New("Segoe UI Semibold", 34))
+            using (var fS = SF.New("Segoe UI", 14))
             {
                 g.DrawString(TimeStr(true), fT, fg, 10, 2);
                 using (var sf = new StringFormat()) { sf.Alignment = StringAlignment.Far;
@@ -1303,9 +1573,9 @@ namespace TurzxScreen
             DrawBackground(g, w, h);
             using (var fg = new SolidBrush(fgColor)) using (var dim = new SolidBrush(Color.FromArgb(160, fgColor)))
             using (var acc = new SolidBrush(accent)) using (var panel = new SolidBrush(Color.FromArgb(70, 0, 0, 0)))
-            using (var fL = new Font("Segoe UI Semibold", 13, GraphicsUnit.Pixel))
-            using (var fV = new Font("Segoe UI Semibold", 26, GraphicsUnit.Pixel))
-            using (var fX = new Font("Segoe UI", 12, GraphicsUnit.Pixel))
+            using (var fL = SF.New("Segoe UI Semibold", 13))
+            using (var fV = SF.New("Segoe UI Semibold", 26))
+            using (var fX = SF.New("Segoe UI", 12))
             {
                 int top = DrawHeader(g, w, fg, dim, acc);
                 // segue a ordem da aba Cartoes (so CPU, RAM e GPU tem historico)
@@ -1340,10 +1610,10 @@ namespace TurzxScreen
             DrawBackground(g, w, h);
             using (var fg = new SolidBrush(fgColor)) using (var dim = new SolidBrush(Color.FromArgb(170, fgColor)))
             using (var acc = new SolidBrush(accent))
-            using (var fBig = new Font("Segoe UI Light", w > h ? 132 : 104, GraphicsUnit.Pixel))
-            using (var fSec = new Font("Segoe UI Light", 40, GraphicsUnit.Pixel))
-            using (var fDate = new Font("Segoe UI", 20, GraphicsUnit.Pixel))
-            using (var fS = new Font("Segoe UI", 14, GraphicsUnit.Pixel))
+            using (var fBig = SF.New("Segoe UI Light", w > h ? 132 : 104))
+            using (var fSec = SF.New("Segoe UI Light", 40))
+            using (var fDate = SF.New("Segoe UI", 20))
+            using (var fS = SF.New("Segoe UI", 14))
             using (var sf = new StringFormat(StringFormat.GenericTypographic))
             {
                 string hm = TimeStr(false), ss = DateTime.Now.ToString("ss");
@@ -1362,26 +1632,128 @@ namespace TurzxScreen
 
         void DrawGauges(Graphics g, int w, int h)
         {
+            // os 3 primeiros cartoes com porcentagem/temperatura, na ordem da aba Cartoes
+            var items = new List<object[]>();
+            foreach (var id in cardOrder)
+            {
+                if (items.Count >= 3 || !cardOn.Contains(id)) continue;
+                var cd = BuildCard(id, false);
+                if (cd == null || cd.Pct < 0) continue;
+                string lbl = id == "gpu" && !cardOn.Contains("gputemp") ? "GPU " + SysInfo.GpuTemp.ToString("0") + "°C" : cd.Label;
+                items.Add(new object[] { lbl, cd.Pct, cd });
+            }
+            if (items.Count == 0) items.Add(new object[] { "CPU", SysInfo.Cpu, new CardData() });
+            DrawGaugeSet(g, w, h, items, showNet ? "↓ " + SysInfo.Rate(SysInfo.NetDown) + "    ↑ " + SysInfo.Rate(SysInfo.NetUp) : null);
+        }
+
+        // ---------------- tema Temperaturas: CPU, GPU e SSD em medidores, ventoinhas no rodape
+        static readonly string[] TempIds = { "cputemp", "gputemp", "ssdtemp" };
+
+        List<object[]> TempItems()
+        {
+            var items = new List<object[]>();
+            foreach (var id in TempIds)
+            {
+                var cd = BuildCard(id, false);
+                if (cd == null || cd.Pct < 0) continue;
+                items.Add(new object[] { cd.Label.Replace("TEMP. ", ""), cd.Pct, cd });
+            }
+            return items;
+        }
+
+        string TempFooter()
+        {
+            var parts = new List<string>();
+            if (Lhm.CaseFan >= 0) parts.Add("Ventoinhas " + Lhm.CaseFan.ToString("0") + " RPM");
+            if (Lhm.GpuFan >= 0) parts.Add("Fan GPU " + Lhm.GpuFan.ToString("0") + " RPM");
+            return parts.Count > 0 ? string.Join("   ·   ", parts.ToArray()) : null;
+        }
+
+        void DrawTemps(Graphics g, int w, int h)
+        {
+            var items = TempItems();
+            if (items.Count > 0) { DrawGaugeSet(g, w, h, items, TempFooter()); return; }
+            DrawBackground(g, w, h);
+            var cd = BuildCard("cputemp", false);
+            using (var fg = new SolidBrush(fgColor)) using (var dim = new SolidBrush(Color.FromArgb(160, fgColor))) using (var acc = new SolidBrush(accent))
+            using (var f = SF.New("Segoe UI", 16)) using (var c = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+            {
+                int top = DrawHeader(g, w, fg, dim, acc);
+                g.DrawString("Temperaturas indisponíveis\n" + (cd != null && cd.Sub != "" ? cd.Sub : ""), f, dim, new RectangleF(0, top, w, h - top - stripInset), c);
+            }
+        }
+
+        // ---------------- tema Baterias: um painel por periferico
+        void DrawBatteries(Graphics g, int w, int h)
+        {
+            DrawBackground(g, w, h);
+            using (var fg = new SolidBrush(fgColor)) using (var dim = new SolidBrush(Color.FromArgb(160, fgColor)))
+            using (var acc = new SolidBrush(accent)) using (var panel = new SolidBrush(Color.FromArgb(70, 0, 0, 0)))
+            using (var barBg = new SolidBrush(Color.FromArgb(50, fgColor)))
+            using (var near = new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap })
+            using (var far = new StringFormat { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center, FormatFlags = StringFormatFlags.NoWrap })
+            {
+                int top = DrawHeader(g, w, fg, dim, acc), pad = 8;
+                var list = new List<BatteryDevice>(Batteries.List);
+                int bottom = h - pad - stripInset;
+                if (list.Count == 0)
+                    using (var f = SF.New("Segoe UI", 16)) using (var c = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+                    { g.DrawString("Nenhum periférico sem fio conectado", f, dim, new RectangleF(0, top, w, bottom - top), c); return; }
+                int max = Math.Max(1, (bottom - top - pad) / (34 + pad));
+                if (list.Count > max) list.RemoveRange(max, list.Count - max);
+                int n = list.Count, rh = Math.Min(w > h ? 96 : 104, (bottom - top - pad * n) / n);
+                bool big = rh >= 60;
+                using (var fL = SF.New("Segoe UI Semibold", big ? 13 : 12))
+                using (var fN = SF.New("Segoe UI", big ? 13 : 11))
+                using (var fV = SF.New("Segoe UI Semibold", big ? Math.Min(34, rh / 2) : Math.Max(14, rh / 2)))
+                    for (int i = 0; i < n; i++)
+                    {
+                        var d = list[i];
+                        var r = new Rectangle(pad, top + pad + i * (rh + pad), w - pad * 2, rh);
+                        using (var p = Round(r, 8)) g.FillPath(panel, p);
+                        Brush main = d.Asleep ? dim : fg;
+                        string pct = d.Percent >= 0 ? d.Percent + "%" : d.Charging ? "carregando" : "—";
+                        string kind = Batteries.KindName(d.Kind).ToUpperInvariant() + (d.Charging ? "  ⚡" : "");
+                        string name = d.Name + (d.Asleep ? " · dormindo" : "") + (d.Via != "" ? "  ·  " + d.Via : "");
+                        int barH = big ? 8 : 5, barY = r.Bottom - barH - (big ? 10 : 6);
+                        int pctW = (int)g.MeasureString("100%", fV).Width + 6;
+                        var textR = new Rectangle(r.X + 10, r.Y + 2, r.Width - 20 - pctW, barY - r.Y - 2);
+                        if (big)
+                        {
+                            g.DrawString(kind, fL, acc, new RectangleF(textR.X, textR.Y + 4, textR.Width, textR.Height / 2), near);
+                            g.DrawString(name, fN, dim, new RectangleF(textR.X, textR.Y + textR.Height / 2, textR.Width, textR.Height / 2), near);
+                        }
+                        else
+                        {
+                            float kw = g.MeasureString(kind, fL).Width;
+                            g.DrawString(kind, fL, acc, new RectangleF(textR.X, textR.Y, textR.Width, textR.Height), near);
+                            g.DrawString(name, fN, dim, new RectangleF(textR.X + kw + 4, textR.Y, Math.Max(1, textR.Width - kw - 4), textR.Height), near);
+                        }
+                        g.DrawString(pct, fV, main, new RectangleF(r.Right - 10 - pctW - 40, r.Y + 2, pctW + 40, barY - r.Y - 2), far);
+                        var b = new Rectangle(r.X + 10, barY, r.Width - 20, barH);
+                        using (var bp = Round(b, barH / 2)) g.FillPath(barBg, bp);
+                        if (d.Percent > 0)
+                        {
+                            b.Width = Math.Max(barH, (int)(b.Width * Math.Min(100, d.Percent) / 100.0));
+                            using (var bb = new SolidBrush(d.Asleep ? Color.FromArgb(120, BatColor(d.Percent)) : BatColor(d.Percent)))
+                            using (var bp = Round(b, barH / 2)) g.FillPath(bb, bp);
+                        }
+                    }
+            }
+        }
+
+        void DrawGaugeSet(Graphics g, int w, int h, List<object[]> items, string footer)
+        {
             DrawBackground(g, w, h);
             using (var fg = new SolidBrush(fgColor)) using (var dim = new SolidBrush(Color.FromArgb(160, fgColor)))
             using (var acc = new SolidBrush(accent))
-            using (var fV = new Font("Segoe UI Semibold", 26, GraphicsUnit.Pixel))
-            using (var fL = new Font("Segoe UI", 13, GraphicsUnit.Pixel))
+            using (var fV = SF.New("Segoe UI Semibold", 26))
+            using (var fL = SF.New("Segoe UI", 13))
             using (var c = new StringFormat())
             {
                 c.Alignment = StringAlignment.Center; c.LineAlignment = StringAlignment.Center;
                 int top = DrawHeader(g, w, fg, dim, acc);
-                // os 3 primeiros cartoes com porcentagem/temperatura, na ordem da aba Cartoes
-                var items = new List<object[]>();
-                foreach (var id in cardOrder)
-                {
-                    if (items.Count >= 3 || !cardOn.Contains(id)) continue;
-                    var cd = BuildCard(id, false);
-                    if (cd == null || cd.Pct < 0) continue;
-                    string lbl = id == "gpu" && !cardOn.Contains("gputemp") ? "GPU " + SysInfo.GpuTemp.ToString("0") + "°C" : cd.Label;
-                    items.Add(new object[] { lbl, cd.Pct, cd.Temp });
-                }
-                if (items.Count == 0) items.Add(new object[] { "CPU", SysInfo.Cpu, false });
+                bool showNet = footer != null;
                 int cols = w > h ? items.Count : 1;
                 int rowsN = (items.Count + cols - 1) / cols;
                 int bottom = (showNet ? h - 26 : h - 6) - stripInset;
@@ -1396,8 +1768,9 @@ namespace TurzxScreen
                         int cx = (i % cols) * cellW + cellW / 2, cy = top + (i / cols) * cellH + cellH / 2;
                         var r = new Rectangle(cx - d / 2, cy - d / 2, d, d);
                         double v = Math.Max(0, Math.Min(100, (double)items[i][1]));
-                        bool isTemp = (bool)items[i][2];
-                        pen.Color = isTemp ? TempColor(v) : accent;
+                        var icd = (CardData)items[i][2];
+                        bool isTemp = icd.Temp;
+                        pen.Color = CardColor(icd, v);
                         g.DrawArc(bgPen, r, 135, 270);
                         if (v > 0.5) g.DrawArc(pen, r, 135, (float)(270 * v / 100));
                         g.DrawString(v.ToString("0") + (isTemp ? "°C" : "%"), fV, fg, new RectangleF(r.X, r.Y - 6, r.Width, r.Height), c);
@@ -1406,7 +1779,7 @@ namespace TurzxScreen
                 }
                 if (showNet)
                     using (var c2 = new StringFormat()) { c2.Alignment = StringAlignment.Center;
-                        g.DrawString("↓ " + SysInfo.Rate(SysInfo.NetDown) + "    ↑ " + SysInfo.Rate(SysInfo.NetUp), fL, dim, new RectangleF(0, h - 22 - stripInset, w, 20), c2); }
+                        g.DrawString(footer, fL, dim, new RectangleF(0, h - 22 - stripInset, w, 20), c2); }
             }
         }
 
@@ -1470,10 +1843,10 @@ namespace TurzxScreen
         {
             using (var fg = new SolidBrush(fgColor)) using (var dim = new SolidBrush(Color.FromArgb(170, fgColor)))
             using (var acc = new SolidBrush(accent)) using (var panel = new SolidBrush(Color.FromArgb(70, 0, 0, 0)))
-            using (var fBig = new Font("Segoe UI Light", 36, GraphicsUnit.Pixel))
-            using (var fTitle = new Font("Segoe UI Semibold", 18, GraphicsUnit.Pixel))
-            using (var fRow = new Font("Segoe UI Semibold", 15, GraphicsUnit.Pixel))
-            using (var fS = new Font("Segoe UI", 13, GraphicsUnit.Pixel))
+            using (var fBig = SF.New("Segoe UI Light", 36))
+            using (var fTitle = SF.New("Segoe UI Semibold", 18))
+            using (var fRow = SF.New("Segoe UI Semibold", 15))
+            using (var fS = SF.New("Segoe UI", 13))
             using (var ell = new StringFormat()) using (var right = new StringFormat()) using (var mid = new StringFormat())
             {
                 ell.Trimming = StringTrimming.EllipsisCharacter; ell.FormatFlags = StringFormatFlags.NoWrap;
@@ -1508,9 +1881,29 @@ namespace TurzxScreen
             }
         }
 
+        void BuildVpnTab(TabPage t)
+        {
+            CheckBox strip = null, toast = null, hide = null;
+            strip = Chk("Mostrar na faixa de status enquanto conectada", vpnStrip, 10, 10, t, delegate { vpnStrip = strip.Checked; });
+            toast = Chk("Aviso na tela ao conectar e desconectar", vpnToast, 10, 36, t, delegate { vpnToast = toast.Checked; });
+            hide = Chk("Privacidade: esconder o nome do perfil", vpnHide, 10, 62, t, delegate { vpnHide = hide.Checked; });
+            var status = (Label)L("", 10, 94, t); status.AutoSize = false; status.Width = 326; status.Height = 52;
+            var help = L("Cartão \"VPN conectada\" na aba Cartões e nos widgets.\n\nReconhece: OpenVPN GUI (com o perfil), OpenVPN\nConnect, WatchGuard, FortiClient, Check Point,\nSonicWall, DrayTek, GlobalProtect e as VPNs do\nWindows (com o nome da conexão). Só lê as placas\nde rede, nada é alterado.", 10, 152, t);
+            help.ForeColor = Color.Gray;
+            var tm = new System.Windows.Forms.Timer(); tm.Interval = 1500; tm.Start();
+            tm.Tick += delegate
+            {
+                var l = Vpn.List;
+                status.ForeColor = l.Count > 0 ? Color.SeaGreen : Color.Gray;
+                if (l.Count == 0) { status.Text = "Nenhuma VPN conectada."; return; }
+                var s = "Conectada:"; foreach (var c in l) s += "\n" + Vpn.Describe(c, false);
+                status.Text = s;
+            };
+        }
+
         void BuildAgendaTab(TabPage t)
         {
-            L("Link ICS do calendario (ou arquivo .ics):", 8, 8, t);
+            L("Link ICS do calendário (ou arquivo .ics):", 8, 8, t);
             var txt = Add(new TextBox(), 10, 30, 326, t); txt.Text = Agenda.Sources; txt.UseSystemPasswordChar = true;
             txt.Leave += delegate { Agenda.Sources = txt.Text; };
             txt.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { Agenda.Sources = txt.Text; e.SuppressKeyPress = true; } };
@@ -1523,9 +1916,9 @@ namespace TurzxScreen
             lead.ValueChanged += delegate { meetLead = (int)lead.Value; };
             L("min", 292, 88, t);
             toast = Chk("Aviso na tela 5 min e 1 min antes", meetToast, 10, 114, t, delegate { meetToast = toast.Checked; });
-            hide = Chk("Privacidade: esconder titulo e local", meetHide, 10, 140, t, delegate { meetHide = hide.Checked; });
+            hide = Chk("Privacidade: esconder título e local", meetHide, 10, 140, t, delegate { meetHide = hide.Checked; });
             var status = (Label)L("", 10, 168, t); status.AutoSize = false; status.Width = 326; status.Height = 34;
-            var help = L("Outlook na web: Configuracoes > Calendario >\nCalendarios compartilhados > Publicar um calendario\n> Pode ver todos os detalhes > copie o link ICS.\nGoogle: Configuracoes do calendario > Endereco\nsecreto no formato iCal.", 10, 206, t);
+            var help = L("Outlook na web: Configurações > Calendário >\nCalendários compartilhados > Publicar um calendário\n> Pode ver todos os detalhes > copie o link ICS.\nGoogle: Configurações do calendário > Endereço\nsecreto no formato iCal.", 10, 206, t);
             help.ForeColor = Color.Gray;
             var tm = new System.Windows.Forms.Timer(); tm.Interval = 1500; tm.Start();
             tm.Tick += delegate
@@ -1533,9 +1926,9 @@ namespace TurzxScreen
                 var m = Agenda.Next();
                 status.ForeColor = Agenda.Error != "" ? Color.Firebrick : Color.SeaGreen;
                 status.Text = Agenda.Error != "" ? Agenda.Error
-                    : Agenda.Sources.Trim() == "" ? "Nenhum calendario configurado."
-                    : Agenda.LastSync == DateTime.MinValue ? "Lendo calendario..."
-                    : Agenda.Items.Count + " compromissos em 14 dias." + (m != null ? " Proximo: " + MeetingWhen(m) + "." : "");
+                    : Agenda.Sources.Trim() == "" ? "Nenhum calendário configurado."
+                    : Agenda.LastSync == DateTime.MinValue ? "Lendo calendário..."
+                    : Agenda.Items.Count + " compromissos em 14 dias." + (m != null ? " Próximo: " + MeetingWhen(m) + "." : "");
             };
         }
 
@@ -1548,10 +1941,10 @@ namespace TurzxScreen
             using (var fg = new SolidBrush(fgColor)) using (var dim = new SolidBrush(Color.FromArgb(165, fgColor)))
             using (var acc = new SolidBrush(accent)) using (var panel = new SolidBrush(Color.FromArgb(70, 0, 0, 0)))
             using (var fpsB = new SolidBrush(fpsColor))
-            using (var fTitle = new Font("Segoe UI Semibold", 16, GraphicsUnit.Pixel))
-            using (var fLabel = new Font("Segoe UI Semibold", 11, GraphicsUnit.Pixel))
-            using (var fVal = new Font("Segoe UI Semibold", 20, GraphicsUnit.Pixel))
-            using (var fS = new Font("Segoe UI", 13, GraphicsUnit.Pixel))
+            using (var fTitle = SF.New("Segoe UI Semibold", 16))
+            using (var fLabel = SF.New("Segoe UI Semibold", 11))
+            using (var fVal = SF.New("Segoe UI Semibold", 20))
+            using (var fS = SF.New("Segoe UI", 13))
             using (var ell = new StringFormat()) using (var right = new StringFormat()) using (var center = new StringFormat())
             {
                 ell.Trimming = StringTrimming.EllipsisCharacter; ell.FormatFlags = StringFormatFlags.NoWrap;
@@ -1602,9 +1995,9 @@ namespace TurzxScreen
             Color fpsColor = fps < 0 ? fgColor : fps < 30 ? Color.FromArgb(239, 83, 80) : fps < 55 ? Color.FromArgb(255, 167, 38) : accent;
             int px = Math.Max(16, Math.Min(74, (int)Math.Round(r.Height * 0.56)));
             using (var fg = new SolidBrush(fgColor)) using (var dim = new SolidBrush(Color.FromArgb(165, fgColor))) using (var fpsB = new SolidBrush(fpsColor))
-            using (var fFps = new Font("Segoe UI Semibold", px, GraphicsUnit.Pixel))
-            using (var fLabel = new Font("Segoe UI Semibold", 11, GraphicsUnit.Pixel))
-            using (var fS = new Font("Segoe UI", 13, GraphicsUnit.Pixel))
+            using (var fFps = SF.New("Segoe UI Semibold", px))
+            using (var fLabel = SF.New("Segoe UI Semibold", 11))
+            using (var fS = SF.New("Segoe UI", 13))
             using (var center = new StringFormat())
             {
                 center.Alignment = StringAlignment.Center;
@@ -1624,7 +2017,7 @@ namespace TurzxScreen
         {
             if (!Media.Has) { DrawBigClock(g, w, h); return; }
             lock (widgetLock) DrawPlayer(g, w, h); // o editor pode estar desenhando a mesma capa
-            using (var fClock = new Font("Segoe UI Light", 30, GraphicsUnit.Pixel))
+            using (var fClock = SF.New("Segoe UI Light", 30))
             using (var white = new SolidBrush(Color.White)) using (var right = new StringFormat())
             {
                 right.Alignment = StringAlignment.Far;
@@ -1660,10 +2053,10 @@ namespace TurzxScreen
             bool land = w > h;
             int cs = Math.Max(16, land ? Math.Min(200, h - 16) : Math.Min(236, Math.Min(w - 24, h / 2)));
             var cr = land ? new Rectangle(Math.Min(16, w / 20), Math.Max(4, (h - cs) / 2 - 8), cs, cs) : new Rectangle((w - cs) / 2, Math.Min(40, h / 12), cs, cs);
-            using (var fSmall = new Font("Segoe UI Semibold", 12, GraphicsUnit.Pixel))
-            using (var fTitle = new Font("Segoe UI Semibold", 23, GraphicsUnit.Pixel))
-            using (var fArtist = new Font("Segoe UI", 17, GraphicsUnit.Pixel))
-            using (var fAlbum = new Font("Segoe UI", 14, GraphicsUnit.Pixel))
+            using (var fSmall = SF.New("Segoe UI Semibold", 12))
+            using (var fTitle = SF.New("Segoe UI Semibold", 23))
+            using (var fArtist = SF.New("Segoe UI", 17))
+            using (var fAlbum = SF.New("Segoe UI", 14))
             using (var white = new SolidBrush(Color.White)) using (var dim = new SolidBrush(Color.FromArgb(190, 255, 255, 255)))
             using (var acc = new SolidBrush(accent))
             using (var ell = new StringFormat()) using (var ell1 = new StringFormat()) using (var right = new StringFormat())
@@ -1680,7 +2073,7 @@ namespace TurzxScreen
                 {
                     if (cover != null) { var clip = g.Clip; g.SetClip(path); g.DrawImage(cover, cr); g.Clip = clip; }
                     else using (var nb = new SolidBrush(Color.FromArgb(60, 255, 255, 255))) { g.FillPath(nb, path);
-                        using (var fn = new Font("Segoe UI Symbol", 80, GraphicsUnit.Pixel)) using (var c = new StringFormat()) {
+                        using (var fn = SF.New("Segoe UI Symbol", 80)) using (var c = new StringFormat()) {
                             c.Alignment = StringAlignment.Center; c.LineAlignment = StringAlignment.Center; g.DrawString("♪", fn, dim, cr, c); } }
                 }
 
@@ -1732,9 +2125,9 @@ namespace TurzxScreen
         {
             using (var fg = new SolidBrush(fgColor)) using (var dim = new SolidBrush(Color.FromArgb(170, fgColor)))
             using (var acc = new SolidBrush(accent))
-            using (var fTemp = new Font("Segoe UI Light", 50, GraphicsUnit.Pixel))
-            using (var fM = new Font("Segoe UI Semibold", 15, GraphicsUnit.Pixel))
-            using (var fS = new Font("Segoe UI", 13, GraphicsUnit.Pixel))
+            using (var fTemp = SF.New("Segoe UI Light", 50))
+            using (var fM = SF.New("Segoe UI Semibold", 15))
+            using (var fS = SF.New("Segoe UI", 13))
             using (var center = new StringFormat())
             using (var ell = new StringFormat())
             {
@@ -1778,8 +2171,8 @@ namespace TurzxScreen
         {
             using (var fg = new SolidBrush(fgColor)) using (var dim = new SolidBrush(Color.FromArgb(170, fgColor)))
             using (var acc = new SolidBrush(accent))
-            using (var fS = new Font("Segoe UI", 13, GraphicsUnit.Pixel))
-            using (var fQ = new Font("Segoe UI Semibold", 20, GraphicsUnit.Pixel))
+            using (var fS = SF.New("Segoe UI", 13))
+            using (var fQ = SF.New("Segoe UI Semibold", 20))
             using (var right = new StringFormat())
             using (var ell = new StringFormat())
             {
@@ -1818,10 +2211,10 @@ namespace TurzxScreen
             using (var fg = new SolidBrush(fgColor))
             using (var dim = new SolidBrush(Color.FromArgb(160, fgColor)))
             using (var acc = new SolidBrush(accent))
-            using (var fTime = new Font("Segoe UI Light", h > w ? 54 : 50, FontStyle.Regular, GraphicsUnit.Pixel))
-            using (var fSmall = new Font("Segoe UI", 15, GraphicsUnit.Pixel))
-            using (var fLabel = new Font("Segoe UI Semibold", 13, GraphicsUnit.Pixel))
-            using (var fVal = new Font("Segoe UI Semibold", 24, GraphicsUnit.Pixel))
+            using (var fTime = SF.New("Segoe UI Light", h > w ? 54 : 50))
+            using (var fSmall = SF.New("Segoe UI", 15))
+            using (var fLabel = SF.New("Segoe UI Semibold", 13))
+            using (var fVal = SF.New("Segoe UI Semibold", 24))
             {
                 string time = now.ToString(clock24 ? "HH:mm:ss" : "hh:mm:ss tt", pt);
                 g.DrawString(time, fTime, fg, 14, 6);
@@ -1835,7 +2228,7 @@ namespace TurzxScreen
 
                 // especificacoes no cabecalho (ao lado da hora)
                 if (specMode == 2 || specMode == 3)
-                    using (var fSpec = new Font("Segoe UI", 13, GraphicsUnit.Pixel))
+                    using (var fSpec = SF.New("Segoe UI", 13))
                     using (var sf = new StringFormat())
                     {
                         sf.Trimming = StringTrimming.EllipsisCharacter; sf.FormatFlags = StringFormatFlags.NoWrap;
@@ -1863,9 +2256,9 @@ namespace TurzxScreen
                 if (rows == 0) return;
                 int cw = (w - pad * (cols + 1)) / cols, ch = Math.Min(110, (h - top - pad * (rows + 1)) / rows);
                 bool compact = ch < 80;   // 3 linhas de cartoes: sem subtitulo, fontes menores
-                using (var fValS = new Font("Segoe UI Semibold", 20, GraphicsUnit.Pixel))
-                using (var fLabelS = new Font("Segoe UI Semibold", 11, GraphicsUnit.Pixel))
-                using (var fSub = new Font("Segoe UI", 12, GraphicsUnit.Pixel))
+                using (var fValS = SF.New("Segoe UI Semibold", 20))
+                using (var fLabelS = SF.New("Segoe UI Semibold", 11))
+                using (var fSub = SF.New("Segoe UI", 12))
                 using (var ell = new StringFormat())
                 using (var cardBg = new SolidBrush(Color.FromArgb(70, 0, 0, 0)))
                 using (var barBg = new SolidBrush(Color.FromArgb(50, fgColor)))
@@ -1876,7 +2269,7 @@ namespace TurzxScreen
                         var c = cards[i];
                         int cx = pad + (i % cols) * (cw + pad), cy = top + pad + (i / cols) * (ch + pad);
                         using (var path = Round(new Rectangle(cx, cy, cw, ch), 10)) g.FillPath(cardBg, path);
-                        Color barColor = c.Temp ? TempColor(c.Pct) : accent;
+                        Color barColor = CardColor(c, c.Pct);
                         using (var bb = new SolidBrush(barColor))
                         {
                             if (compact)
@@ -1904,12 +2297,166 @@ namespace TurzxScreen
         }
 
         // ---------------- cartoes configuraveis
-        class CardData { public string Label = "", Value = "", Sub = ""; public double Pct = -1; public bool Temp; }
+        class CardData { public string Label = "", Value = "", Sub = ""; public double Pct = -1; public bool Temp, Bat; }
 
         static readonly string[] CardIds = { "cpu", "ram", "gpu", "cputemp", "gputemp", "disk", "down", "up",
-            "cpuclock", "gpuclock", "cpupower", "gpupower", "fan", "gpufan", "ssdtemp", "meeting" };
-        static readonly string[] CardNames = { "CPU (uso)", "Memoria RAM", "GPU (uso)", "Temperatura da CPU", "Temperatura da GPU", "Disco C:", "Download", "Upload",
-            "Clock da CPU", "Clock da GPU", "Consumo da CPU", "Consumo da GPU", "Ventoinhas do gabinete", "Ventoinha da GPU", "Temperatura do SSD", "Proxima reuniao" };
+            "cpuclock", "gpuclock", "cpupower", "gpupower", "fan", "gpufan", "ssdtemp", "meeting",
+            "batmouse", "batkeyboard", "batheadset", "batgamepad", "vpn" };
+        static readonly string[] CardNames = { "CPU (uso)", "Memória RAM", "GPU (uso)", "Temperatura da CPU", "Temperatura da GPU", "Disco C:", "Download", "Upload",
+            "Clock da CPU", "Clock da GPU", "Consumo da CPU", "Consumo da GPU", "Ventoinhas do gabinete", "Ventoinha da GPU", "Temperatura do SSD", "Próxima reunião",
+            "Bateria do mouse", "Bateria do teclado", "Bateria do fone", "Bateria do controle", "VPN conectada" };
+        bool batWarn = true;
+
+        // ---------------- VPN
+        bool vpnStrip = true, vpnToast = true, vpnHide;
+        string vpnShown = "";
+
+        void TickVpn()
+        {
+            var l = Vpn.List;
+            string text = "";
+            foreach (var c in l) text += (text != "" ? "  +  " : "") + Vpn.Describe(c, vpnHide);
+            if (vpnStrip && text != "" && !(lastEffMode == 0 && lastEffTheme == VpnTheme)) // no tema VPN a faixa repetiria
+            {
+                // prioridade minima: o Claude Code e a reuniao passam na frente
+                var i = new StatusItem { Key = "vpn", Label = "VPN", State = "info", Text = text, Expires = DateTime.Now.AddSeconds(30) };
+                if (text != vpnShown || DateTime.Now.Second % 10 == 0) StatusBoard.Set(i, false);
+                vpnShown = text;
+            }
+            else if (vpnShown != "") { StatusBoard.Remove("vpn"); vpnShown = ""; }
+        }
+
+        // tema VPN
+        void DrawVpnTheme(Graphics g, int w, int h)
+        {
+            DrawBackground(g, w, h);
+            int top;
+            using (var fg = new SolidBrush(fgColor)) using (var dim = new SolidBrush(Color.FromArgb(160, fgColor))) using (var acc = new SolidBrush(accent))
+                top = DrawHeader(g, w, fg, dim, acc);
+            DrawVpnBox(g, new Rectangle(8, top + 6, w - 16, h - top - 14 - stripInset), true, false, 0);
+        }
+
+        static readonly Color VpnGreen = Color.FromArgb(76, 199, 120);
+
+        // uma linha por VPN conectada: nome do cliente, perfil, tempo conectada e trafego
+        void DrawVpnBox(Graphics g, Rectangle box, bool rowPanels, bool label, int font)
+        {
+            var l = Vpn.List;
+            using (var fg = new SolidBrush(fgColor)) using (var dim = new SolidBrush(Color.FromArgb(160, fgColor)))
+            using (var acc = new SolidBrush(accent)) using (var panel = new SolidBrush(Color.FromArgb(70, 0, 0, 0)))
+            using (var green = new SolidBrush(VpnGreen))
+            using (var near = new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap })
+            {
+                if (label && box.Height >= 40)
+                    using (var f = SF.New("Segoe UI Semibold", Math.Max(9, Math.Min(13, box.Height / 6))))
+                    {
+                        g.DrawString("VPN", f, acc, new RectangleF(box.X + 7, box.Y + 4, box.Width - 14, f.Height), near);
+                        box = new Rectangle(box.X, box.Y + f.Height + 6, box.Width, box.Height - f.Height - 6);
+                    }
+                if (l.Count == 0)
+                {
+                    int px = font > 0 ? font : Math.Max(11, Math.Min(22, box.Height / 6));
+                    using (var f = SF.New("Segoe UI", px))
+                    using (var c = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter })
+                    using (var off = new SolidBrush(Color.FromArgb(90, fgColor)))
+                    {
+                        string s = "Nenhuma VPN conectada";
+                        var sz = g.MeasureString(s, f);
+                        float dot = px * 0.6f, total = dot + 8 + sz.Width, x0 = box.X + Math.Max(0, (box.Width - total) / 2), cy = box.Y + box.Height / 2f;
+                        g.FillEllipse(off, x0, cy - dot / 2, dot, dot);
+                        g.DrawString(s, f, dim, new RectangleF(x0 + dot + 8, box.Y, box.Width - (x0 - box.X) - dot - 8, box.Height), near);
+                    }
+                    return;
+                }
+                int gap = rowPanels ? 8 : 4, n = Math.Min(l.Count, Math.Max(1, (box.Height + gap) / (30 + gap)));
+                int rh = Math.Min(rowPanels ? 120 : 90, (box.Height - gap * (n - 1)) / n);
+                for (int i = 0; i < n; i++)
+                {
+                    var c = l[i];
+                    var r = new Rectangle(box.X, box.Y + i * (rh + gap), box.Width, rh);
+                    if (rowPanels) using (var p = Round(r, 8)) g.FillPath(panel, p);
+                    bool big = rh >= 56;
+                    int pxName = font > 0 ? font : Math.Max(12, Math.Min(26, rh * 26 / 100));
+                    int pxSub = Math.Max(10, Math.Min(16, pxName * 6 / 10)), pxDet = Math.Max(10, Math.Min(13, pxName / 2));
+                    string main = Vpn.Place(c, vpnHide), prof = Vpn.Program(c, vpnHide); // perfil em destaque, programa embaixo
+                    string det = "conectada há " + Vpn.Duration(c);
+                    if (c.Down >= 0) det += "   ↓ " + SysInfo.Rate(c.Down) + "   ↑ " + SysInfo.Rate(c.Up);
+                    using (var fN = SF.New("Segoe UI Semibold", pxName))
+                    using (var fS = SF.New("Segoe UI", pxSub))
+                    using (var fD = SF.New("Segoe UI", pxDet))
+                    {
+                        int pad = rowPanels ? 12 : 7;
+                        float dot = Math.Max(7, pxName * 0.45f);
+                        int tx = r.X + pad + (int)dot + 8, tw = Math.Max(1, r.Right - pad - tx);
+                        if (big)
+                        {
+                            int lines = prof != "" ? 3 : 2;
+                            float hN = fN.Height, hS = prof != "" ? fS.Height : 0, hD = fD.Height, tot = hN + hS + hD + 4 * (lines - 1);
+                            float y = r.Y + Math.Max(2, (r.Height - tot) / 2);
+                            g.FillEllipse(green, r.X + pad, y + hN / 2 - dot / 2, dot, dot);
+                            g.DrawString(main, fN, fg, new RectangleF(tx, y, tw, hN), near); y += hN + 4;
+                            if (prof != "") { g.DrawString(prof, fS, acc, new RectangleF(tx, y, tw, hS), near); y += hS + 4; }
+                            g.DrawString(det, fD, dim, new RectangleF(tx, y, tw, hD), near);
+                        }
+                        else
+                        {
+                            g.FillEllipse(green, r.X + pad, r.Y + r.Height / 2f - dot / 2, dot, dot);
+                            float nw = g.MeasureString(main, fN).Width;
+                            g.DrawString(main, fN, fg, new RectangleF(tx, r.Y, tw, r.Height), near);
+                            string rest = (prof != "" ? prof + " · " : "") + Vpn.Duration(c);
+                            g.DrawString(rest, fS, dim, new RectangleF(tx + nw + 2, r.Y, Math.Max(1, tw - nw - 2), r.Height), near);
+                        }
+                    }
+                }
+            }
+        }
+
+        string VpnText()
+        {
+            var l = Vpn.List;
+            if (l.Count == 0) return "VPN desligada";
+            string s = ""; foreach (var c in l) s += (s != "" ? " + " : "") + Vpn.Describe(c, vpnHide);
+            return s;
+        }
+
+        CardData VpnCard()
+        {
+            var l = Vpn.List;
+            var c = new CardData { Label = "VPN" };
+            if (l.Count == 0) { c.Value = "desligada"; return c; }
+            c.Value = Vpn.Place(l[0], vpnHide);
+            string sec = Vpn.Program(l[0], vpnHide);
+            c.Sub = sec + (l.Count > 1 ? (sec != "" ? " " : "") + "(+" + (l.Count - 1) + ")" : "");
+            return c;
+        }
+
+        static Color BatColor(double p)
+        {
+            if (p <= 20) return Color.FromArgb(239, 83, 80);
+            if (p <= 40) return Color.FromArgb(255, 167, 38);
+            return Color.FromArgb(76, 199, 120);
+        }
+
+        Color CardColor(CardData c, double v)
+        {
+            if (c.Temp) return TempColor(v);
+            if (c.Bat) return BatColor(v);
+            return accent;
+        }
+
+        static CardData BatteryCard(string kind)
+        {
+            var d = Batteries.Lowest(kind);
+            if (d == null) return null;
+            int n = 0; foreach (var x in Batteries.List) if (x.Kind == kind) n++;
+            var c = new CardData { Label = Batteries.KindName(kind).ToUpperInvariant(), Bat = true };
+            if (d.Percent >= 0) { c.Value = d.Percent + "%"; c.Pct = d.Percent; }
+            else c.Value = d.Charging ? "carregando" : "—";
+            c.Sub = d.Name + (n > 1 ? " (+" + (n - 1) + ")" : "");
+            if (d.Charging && d.Percent >= 0) c.Sub = "⚡ " + c.Sub;
+            else if (d.Asleep) c.Sub += " · dormindo";
+            return c;
+        }
         volatile List<string> cardOrder = new List<string>(CardIds);
         volatile HashSet<string> cardOn = new HashSet<string>(new[] { "cpu", "ram", "gpu", "cputemp", "gputemp", "disk" });
         int specMode = 2; // 0 nao mostrar, 1 nos cartoes, 2 no cabecalho, 3 os dois
@@ -1956,7 +2503,7 @@ namespace TurzxScreen
                 case "meeting":
                     var nextMeet = Agenda.Next();
                     c.Label = "REUNIÃO";
-                    if (nextMeet == null) { c.Value = "—"; c.Sub = "sem reunioes"; break; }
+                    if (nextMeet == null) { c.Value = "—"; c.Sub = "sem reuniões"; break; }
                     c.Value = MeetingWhen(nextMeet); c.Sub = MeetingTitle(nextMeet); break;
                 case "cpuclock":
                     if (Lhm.CpuClockGhz < 0) return null;
@@ -1971,7 +2518,7 @@ namespace TurzxScreen
                     SysInfo.NeedGpuPowerUntil = DateTime.Now.AddSeconds(5);
                     double gw = Lhm.GpuPower >= 0 ? Lhm.GpuPower : SysInfo.GpuPowerSmi;
                     c.Label = "CONSUMO GPU"; c.Value = gw >= 0 ? gw.ToString("0") + " W" : "—";
-                    if (gw < 0 && SysInfo.GpuPowerUnsupported) c.Sub = "driver nao informa";
+                    if (gw < 0 && SysInfo.GpuPowerUnsupported) c.Sub = "driver não informa";
                     break;
                 case "fan":
                     if (Lhm.CaseFan < 0) return null;
@@ -1982,6 +2529,11 @@ namespace TurzxScreen
                 case "ssdtemp":
                     if (Lhm.SsdTemp < 0) return null;
                     c.Label = "TEMP. SSD"; c.Temp = true; c.Value = Lhm.SsdTemp.ToString("0") + " °C"; c.Pct = Lhm.SsdTemp; break;
+                case "batmouse": return BatteryCard("mouse");
+                case "batkeyboard": return BatteryCard("keyboard");
+                case "batheadset": return BatteryCard("headset");
+                case "batgamepad": return BatteryCard("gamepad");
+                case "vpn": return VpnCard();
                 default: return null;
             }
             return c;
@@ -2019,8 +2571,12 @@ namespace TurzxScreen
 
         void BuildCardsTab(TabPage tc)
         {
-            L("Marque os cartoes e escolha a ordem:", 8, 6, tc);
-            var list = Add(new CheckedListBox(), 10, 30, 230, tc); list.Height = 150; list.CheckOnClick = true; list.IntegralHeight = false;
+            L("Marque os cartões e escolha a ordem:", 8, 6, tc);
+            var list = Add(new CheckedListBox(), 10, 30, 230, tc); list.Height = 128; list.CheckOnClick = true; list.IntegralHeight = false;
+            var chkBat = Add(new CheckBox(), 10, 162, 330, tc);
+            chkBat.Text = "Avisar quando um periférico ficar com " + Batteries.LowAt + "% de bateria";
+            chkBat.Checked = batWarn;
+            chkBat.CheckedChanged += delegate { batWarn = chkBat.Checked; };
             Action fill = delegate
             {
                 list.Items.Clear();
@@ -2048,12 +2604,12 @@ namespace TurzxScreen
             };
             Btn("▲ Subir", 248, 30, 88, tc, delegate { move(-1); });
             Btn("▼ Descer", 248, 62, 88, tc, delegate { move(1); });
-            var hint = L("Ate 6 cabem\ncom folga;\n7 ou mais\nficam\ncompactos.", 248, 98, tc);
+            var hint = L("Até 6 cabem\ncom folga; 7+\nficam\ncompactos.", 248, 94, tc);
             hint.ForeColor = Color.Gray;
 
-            L("Especificacoes da maquina:", 8, 192, tc);
+            L("Especificações da máquina:", 8, 192, tc);
             var cbSpec = Add(new ComboBox(), 160, 190, 176, tc); cbSpec.DropDownStyle = ComboBoxStyle.DropDownList;
-            cbSpec.Items.AddRange(new object[] { "Nao mostrar", "Dentro dos cartoes", "Ao lado da hora", "Hora e cartoes" });
+            cbSpec.Items.AddRange(new object[] { "Não mostrar", "Dentro dos cartões", "Ao lado da hora", "Hora e cartões" });
             cbSpec.SelectedIndex = Math.Max(0, Math.Min(3, specMode));
             cbSpec.SelectedIndexChanged += delegate { specMode = cbSpec.SelectedIndex; lcd.Invalidate(); };
 
@@ -2082,7 +2638,7 @@ namespace TurzxScreen
             g.Clear(Color.Black);
             if (f == null || f.W != w || f.H != h)
             {
-                using (var ft = new Font("Segoe UI", 16, GraphicsUnit.Pixel)) using (var c = new StringFormat())
+                using (var ft = SF.New("Segoe UI", 16)) using (var c = new StringFormat())
                 {
                     c.Alignment = StringAlignment.Center; c.LineAlignment = StringAlignment.Center;
                     g.DrawString(PhotoFrame.Status != "" ? PhotoFrame.Status : "Carregando fotos...", ft, Brushes.Gray, new RectangleF(0, 0, w, h), c);
@@ -2095,8 +2651,8 @@ namespace TurzxScreen
                 int bottom = h - stripInset, gh = 78;
                 var r = new Rectangle(0, bottom - gh, w, gh);
                 using (var b = new LinearGradientBrush(new Rectangle(r.X, r.Y - 1, r.Width, r.Height + 2), Color.FromArgb(0, 0, 0, 0), Color.FromArgb(185, 0, 0, 0), 90f)) g.FillRectangle(b, r);
-                using (var fTime = new Font("Segoe UI Light", 40, GraphicsUnit.Pixel))
-                using (var fDate = new Font("Segoe UI", 14, GraphicsUnit.Pixel))
+                using (var fTime = SF.New("Segoe UI Light", 40))
+                using (var fDate = SF.New("Segoe UI", 14))
                 using (var right = new StringFormat())
                 {
                     right.Alignment = StringAlignment.Far;
@@ -2117,7 +2673,7 @@ namespace TurzxScreen
             {
                 if (image == null)
                 {
-                    using (var f = new Font("Segoe UI", 18, GraphicsUnit.Pixel)) g.DrawString("Escolha uma imagem no app", f, Brushes.Gray, 20, h / 2 - 12);
+                    using (var f = SF.New("Segoe UI", 18)) g.DrawString("Escolha uma imagem no app", f, Brushes.Gray, 20, h / 2 - 12);
                     return 500;
                 }
                 int delay = 1000;
@@ -2188,7 +2744,7 @@ namespace TurzxScreen
             bool waiting = it.State == "waiting", error = it.State == "error";
             Color back = waiting ? Color.FromArgb(255, 179, 0) : error ? Color.FromArgb(198, 40, 40) : Color.FromArgb(24, 24, 28);
             Color fore = waiting ? Color.FromArgb(20, 20, 20) : Color.White;
-            Color dot = it.State == "working" ? accent : it.State == "done" ? Color.FromArgb(76, 199, 120) : fore;
+            Color dot = it.State == "working" ? accent : it.State == "done" || it.Key == "vpn" ? Color.FromArgb(76, 199, 120) : fore;
             var r = new Rectangle(0, h - 22, w, 22);
             using (var b = new SolidBrush(back)) g.FillRectangle(b, r);
             int x = 10;
@@ -2207,7 +2763,7 @@ namespace TurzxScreen
             var parts = new List<string>();
             foreach (var s in new[] { it.Label, it.Text, it.Detail }) if (s != "") parts.Add(s.Replace('\n', ' '));
             string extra = total > 1 ? "+" + (total - 1) : "";
-            using (var f = new Font("Segoe UI Semibold", 13, GraphicsUnit.Pixel))
+            using (var f = SF.New("Segoe UI Semibold", 13))
             using (var fb = new SolidBrush(fore))
             using (var sf = new StringFormat())
             {
@@ -2241,7 +2797,7 @@ namespace TurzxScreen
             if (text == "") return;
             Color red = Color.FromArgb(217, 45, 32);
             using (var pen = new Pen(red, 4)) g.DrawRectangle(pen, 2, 2, w - 5, h - 5);
-            using (var f = new Font("Segoe UI Semibold", 13, GraphicsUnit.Pixel))
+            using (var f = SF.New("Segoe UI Semibold", 13))
             using (var sf = new StringFormat())
             using (var bg = new SolidBrush(red))
             {
@@ -2266,9 +2822,9 @@ namespace TurzxScreen
             int m = 8, cw = w - m * 2, pad = 14;
             string title = t.Title != "" ? t.Title : t.App;
             string body = notifHideBody ? "Nova mensagem" : t.Body;
-            using (var fApp = new Font("Segoe UI", 13, GraphicsUnit.Pixel))
-            using (var fTitle = new Font("Segoe UI Semibold", 19, GraphicsUnit.Pixel))
-            using (var fBody = new Font("Segoe UI", 17, GraphicsUnit.Pixel))
+            using (var fApp = SF.New("Segoe UI", 13))
+            using (var fTitle = SF.New("Segoe UI Semibold", 19))
+            using (var fBody = SF.New("Segoe UI", 17))
             using (var sfTitle = new StringFormat())
             using (var sfBody = new StringFormat())
             {
@@ -2313,7 +2869,7 @@ namespace TurzxScreen
         void DrawText(Graphics g, int w, int h)
         {
             DrawBackground(g, w, h);
-            using (var f = new Font("Segoe UI Semibold", textSize, GraphicsUnit.Pixel))
+            using (var f = SF.New("Segoe UI Semibold", textSize))
             using (var b = new SolidBrush(fgColor))
             using (var sf = new StringFormat())
             {
